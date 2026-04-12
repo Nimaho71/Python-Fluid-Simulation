@@ -22,7 +22,7 @@ This project uses **Pygame** for rendering and heavily leverages **Numba (@njit,
    pip install -r requirements.txt
    python fluid.py
 
-Controls
+🎮 Controls
 [LMB Click + Hold] Drag an obstacle block OR push the water away radially.
 
 [ C ] Spawn a new obstacle block at your cursor.
