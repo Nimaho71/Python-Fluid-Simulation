@@ -399,15 +399,18 @@ class Slider:
 
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if hitbox.collidepoint(event.pos):
-                if not self.focused:
-                    self.focused = True
-                    self.input_text = ""
-                # If they clicked the physical track, allow dragging
+                # If they clicked the physical track/handle, it's a DRAG
                 if self.rect.collidepoint(event.pos):
                     self.dragging = True
+                    self.focused = False # Prevent text input while dragging!
+                # If they clicked the text label above the track, it's a TYPE
+                else:
+                    if not self.focused:
+                        self.focused = True
+                        self.input_text = ""
                 return True
             else:
-                # Clicked elsewhere: apply the typed value and unfocus
+                # Clicked outside the slider entirely: apply value and unfocus
                 if self.focused:
                     self._apply_input()
                     self.focused = False
