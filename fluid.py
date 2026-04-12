@@ -1,134 +1,343 @@
-"""
-fluid.py — SPH Fluid Simulation (Phase 14 — Dynamic Memory & Performance Graph)
-Changes applied:
-  • Pre-flight Fix: MAX_PARTICLES renamed to INITIAL_CAPACITY; slider ceiling
-    decoupled via SLIDER_MAX so the user can actually reach higher counts.
-  • Pre-flight Fix: calibrate_rest_density now cached — only recomputes when
-    particle_radius changes, not every frame.
-  • Pre-flight Fix: grid_next grows in lockstep with particle arrays inside
-    maybe_grow_arrays() to prevent silent out-of-bounds writes.
-  • Pre-flight Fix: Removed redundant ays[num_active] = gravity_val from the
-    pour loop (integrate() resets it on the very next tick anyway).
-  • Phase 14: Dynamic array resizing — maybe_grow_arrays() doubles capacity
-    whenever num_active is about to exceed it, preserving all live particles.
-  • Phase 14: Real-time FPS graph drawn at the bottom of the UI panel using
-    a collections.deque(maxlen=120) ring buffer.
+"""SPH Fluid Simulation — interactive 2D fluid sandbox.
+
+This module implements a real-time Smoothed Particle Hydrodynamics (SPH)
+fluid simulation using Pygame for rendering and Numba for JIT-compiled
+physics kernels.
+
+Quick start::
+
+    pip install pygame numpy numba
+    python fluid.py
+
+Controls:
+    H          Toggle this help overlay
+    Space      Pause / resume the particle stream
+    R          Reset the simulation
+    M          Toggle metaball (liquid blob) rendering
+    C          Spawn a new obstacle block at the cursor
+    X          Delete the obstacle block under the cursor
+    LMB drag   Drag an obstacle block, or push the fluid
+
+Architecture:
+    Constants and config  — top of module, grouped by concern
+    SimState dataclass    — all mutable runtime state in one place
+    Numba kernels         — @njit physics passes (build_grid → densities →
+                            pressure → viscosity → surface_tension →
+                            integrate → resolve)
+    UI helpers            — Slider, Button, draw_fps_graph
+    Render helpers        — draw_flask, draw_obstacles, draw_help_overlay
+    main()                — thin orchestrator: init → loop(events, physics,
+                            render) → quit
+
+SPH notation used throughout the kernels:
+    h   smoothing radius (neighbourhood size)
+    d   distance between two particles
+    W   kernel weight  (how much j influences i at distance d)
+    rho density
+    p   pressure
+    m   particle mass
 """
 
-import pygame
-import random
+from __future__ import annotations
+
 import math
-import numpy as np
-from numba import njit, prange
+import random
 from collections import deque
+from dataclasses import dataclass, field
+from typing import Deque, Tuple
+
+import numpy as np
+import pygame
+from numba import njit, prange
+
 
 # ---------------------------------------------------------------------------
-# Display & Layout
+# Display constants
 # ---------------------------------------------------------------------------
-SIM_WIDTH  = 800
-UI_WIDTH   = 250
-WIDTH      = SIM_WIDTH + UI_WIDTH
-HEIGHT     = 600
-FPS        = 60
-BACKGROUND = (8, 12, 24)
 
-# ---------------------------------------------------------------------------
-# Array Capacity
-# ---------------------------------------------------------------------------
-INITIAL_CAPACITY = 10_000   # Starting allocation — NOT a hard limit anymore.
-SLIDER_MAX       = 30_000   # Ceiling the UI slider is allowed to reach.
+SIM_WIDTH: int = 800    # Width of the simulation viewport in pixels.
+UI_WIDTH: int  = 250    # Width of the right-hand control panel in pixels.
+WIDTH: int     = SIM_WIDTH + UI_WIDTH
+HEIGHT: int    = 600
+TARGET_FPS: int = 60
+BACKGROUND_COLOR: Tuple[int, int, int] = (8, 12, 24)
 
-# Grid is bounded by the smallest possible smoothing radius, not particle count.
-MIN_SMOOTHING_RADIUS = 5.0
-MAX_GRID_COLS = math.ceil(SIM_WIDTH / MIN_SMOOTHING_RADIUS) + 2
-MAX_GRID_ROWS = math.ceil(HEIGHT    / MIN_SMOOTHING_RADIUS) + 2
 
 # ---------------------------------------------------------------------------
-# Static Physics Defaults
+# Particle array capacities
 # ---------------------------------------------------------------------------
-WALL_FRICTION          = 0.05
-INTERIOR_DENSITY_RATIO = 0.85
 
-# Pour stream
-POUR_X      = 180.0
-POUR_Y      = 80.0
-POUR_VX     = 10.0
-POUR_VY     = 2.0
-POUR_RATE   = 8
-POUR_SPREAD = 3.0
+# Starting array size. Arrays double automatically when full (see
+# maybe_grow_arrays), so this is NOT a hard cap — just the initial allocation.
+INITIAL_CAPACITY: int = 10_000
 
-# Mouse
-MOUSE_RADIUS   = 80.0
-MOUSE_STRENGTH = 3.0
+# Maximum value the "Max Particles" slider can reach.
+SLIDER_MAX: int = 30_000
 
+# Grid cell count is bounded by the smallest possible smoothing radius, not
+# by particle count. Pre-allocating at the worst case avoids runtime resizing
+# of the grid arrays, which are small (floats * grid_cols * grid_rows).
+_MIN_SMOOTHING_RADIUS: float = 5.0
+MAX_GRID_COLS: int = math.ceil(SIM_WIDTH / _MIN_SMOOTHING_RADIUS) + 2
+MAX_GRID_ROWS: int = math.ceil(HEIGHT    / _MIN_SMOOTHING_RADIUS) + 2
+
+
+# ---------------------------------------------------------------------------
+# Physics defaults  (all overridable via the Advanced tab sliders at runtime)
+# ---------------------------------------------------------------------------
+
+DEFAULT_GRAVITY: float      = 0.20  # Pixels-per-frame^2 downward acceleration.
+DEFAULT_STIFFNESS: float    = 0.80  # Pressure equation stiffness constant k.
+DEFAULT_VISCOSITY: float    = 0.20  # Velocity-smoothing coefficient mu.
+DEFAULT_SURF_TENSION: float = 0.10  # Surface cohesion force coefficient sigma.
+DEFAULT_RESTITUTION: float  = 0.30  # Wall/obstacle bounce factor (0=none, 1=full).
+
+# Wall friction damps the velocity component parallel to the wall on impact.
+# Not exposed in the UI; tweak here if you want stickier or slipperier walls.
+WALL_FRICTION: float = 0.05
+
+# Surface tension only acts on particles whose density is below this fraction
+# of the rest density. Higher values extend cohesion deeper into the fluid.
+SURFACE_CUTOFF_RATIO: float = 0.85
+
+# Velocity is clamped to this limit (pixels/frame) to prevent tunnelling
+# through thin walls at very high particle counts or stiffness values.
+MAX_PARTICLE_SPEED: float = 25.0
+
+
+# ---------------------------------------------------------------------------
+# Pour stream  — where new particles enter the simulation
+# ---------------------------------------------------------------------------
+
+POUR_X: float      = 180.0  # Horizontal origin of the stream (pixels).
+POUR_Y: float      = 80.0   # Vertical origin of the stream (pixels).
+POUR_VX: float     = 10.0   # Initial horizontal velocity (pixels/frame).
+POUR_VY: float     = 2.0    # Initial vertical velocity (pixels/frame).
+POUR_RATE: int     = 8      # Particles added per frame while pouring.
+POUR_SPREAD: float = 3.0    # +/- pixels of random jitter applied to spawn pos.
+
+
+# ---------------------------------------------------------------------------
+# Mouse interaction
+# ---------------------------------------------------------------------------
+
+MOUSE_PUSH_RADIUS: float   = 80.0  # Influence radius of the push cursor (px).
+MOUSE_PUSH_STRENGTH: float = 3.0   # Maximum impulse applied at the cursor.
+
+
+# ---------------------------------------------------------------------------
 # Metaball renderer
-RENDER_SCALE     = 2
-RENDER_THRESHOLD = 0.5
+# ---------------------------------------------------------------------------
+
+# Render at 1/METABALL_SCALE resolution then upscale, trading sharpness for
+# speed. Value of 2 means physics is at full res, rendering at half res.
+METABALL_SCALE: int       = 2
+METABALL_THRESHOLD: float = 0.5  # Field value at which a pixel is "inside".
+
+# Speed value (pixels/frame) that maps to fully saturated colour in the
+# metaball renderer. Particles faster than this render at maximum saturation.
+METABALL_COLOR_SPEED: float = 12.0
+
 
 # ---------------------------------------------------------------------------
-# Flask geometry
+# Colour (particle heatmap mode)
 # ---------------------------------------------------------------------------
-def build_flask():
+
+# Speed at which the heatmap colour reaches its maximum (orange-red).
+HEATMAP_MAX_SPEED: float = 14.0
+
+
+# ---------------------------------------------------------------------------
+# Flask (container) geometry
+# ---------------------------------------------------------------------------
+
+def _build_flask() -> Tuple[float, float, float, float]:
+    """Return the (left, right, top, bottom) bounds of the container in pixels.
+
+    The flask is centred horizontally in the simulation viewport and
+    positioned slightly below the vertical midpoint to leave room for the
+    pour stream above.
+
+    Returns:
+        A 4-tuple (left_x, right_x, top_y, bottom_y).
+    """
     cx = SIM_WIDTH // 2
     cy = HEIGHT // 2 + 40
-    hw, hh = 260, 200
-    return (float(cx - hw), float(cx + hw), float(cy - hh), float(cy + hh))
-
-FLASK_BOUNDS = build_flask()
-F_LEFT, F_RIGHT, F_TOP, F_BOT = FLASK_BOUNDS
-
-# ---------------------------------------------------------------------------
-# Dynamic Array Management  (Phase 14 core)
-# ---------------------------------------------------------------------------
-def make_particle_arrays(capacity: int):
-    """Allocate a fresh set of particle arrays at the given capacity."""
+    half_width  = 260
+    half_height = 200
     return (
-        np.zeros(capacity, dtype=np.float32),   # xs
-        np.zeros(capacity, dtype=np.float32),   # ys
-        np.zeros(capacity, dtype=np.float32),   # vxs
-        np.zeros(capacity, dtype=np.float32),   # vys
-        np.zeros(capacity, dtype=np.float32),   # axs
-        np.zeros(capacity, dtype=np.float32),   # ays
-        np.zeros(capacity, dtype=np.float32),   # densities
-        np.full(capacity, -1, dtype=np.int32),  # grid_next
+        float(cx - half_width),
+        float(cx + half_width),
+        float(cy - half_height),
+        float(cy + half_height),
     )
 
-def maybe_grow_arrays(num_active, capacity, xs, ys, vxs, vys, axs, ays, densities, grid_next):
+
+_FLASK_BOUNDS = _build_flask()
+F_LEFT, F_RIGHT, F_TOP, F_BOT = _FLASK_BOUNDS
+
+
+# ---------------------------------------------------------------------------
+# Simulation state dataclass
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SimState:
+    """All mutable runtime state for one simulation session.
+
+    Grouping state here keeps main() readable and makes it easy to
+    implement a full reset (just replace the instance).
+
+    Attributes:
+        capacity:            Current length of the particle arrays.
+        num_active:          Number of particles currently alive.
+        xs, ys:              Particle positions (pixels).
+        vxs, vys:            Particle velocities (pixels per frame).
+        axs, ays:            Particle accelerations accumulated this frame.
+        densities:           SPH density estimate for each particle.
+        grid_next:           Linked-list next-index for the spatial grid.
+        grid_head:           Head-of-list for each grid cell.
+        pouring:             True while the particle stream is active.
+        use_metaballs:       True to use the blob renderer instead of circles.
+        show_help:           True to show the help overlay.
+        last_particle_radius: Cached radius used to skip rest-density
+                             recalculation when the size slider has not moved.
+        rest_density:        Cached result of calibrate_rest_density().
+        fps_history:         Ring buffer of recent FPS samples for the graph.
+        obs_xs, obs_ys:      Obstacle top-left corners (pixels).
+        obs_ws, obs_hs:      Obstacle dimensions (pixels).
+        obs_active:          1 if the obstacle slot is in use, else 0.
+        dragging_idx:        Index of the obstacle being dragged, or -1.
+        pushing_water:       True while the user is pushing fluid with LMB.
+        drag_offset_x/y:     Cursor-to-obstacle-corner offset during a drag.
     """
-    If num_active has reached the current capacity, double every particle array
-    and grid_next in one shot, copying live data into the new allocation.
-    Returns (new_capacity, xs, ys, vxs, vys, axs, ays, densities, grid_next).
-    Only allocates when necessary — no per-frame cost in steady state.
-    """
-    if num_active < capacity:
-        return capacity, xs, ys, vxs, vys, axs, ays, densities, grid_next
 
-    new_cap = capacity * 2
-    print(f"[Phase 14] Growing arrays: {capacity} → {new_cap}")
+    # Particle arrays
+    capacity:   int
+    num_active: int
+    xs:         np.ndarray
+    ys:         np.ndarray
+    vxs:        np.ndarray
+    vys:        np.ndarray
+    axs:        np.ndarray
+    ays:        np.ndarray
+    densities:  np.ndarray
+    grid_next:  np.ndarray
+    grid_head:  np.ndarray
 
-    def grow(arr, fill=0):
-        new = np.full(new_cap, fill, dtype=arr.dtype)
-        new[:capacity] = arr[:capacity]
-        return new
+    # Simulation mode flags
+    pouring:       bool = True
+    use_metaballs: bool = False
+    show_help:     bool = True
 
-    return (
-        new_cap,
-        grow(xs),
-        grow(ys),
-        grow(vxs),
-        grow(vys),
-        grow(axs),
-        grow(ays),
-        grow(densities),
-        grow(grid_next, fill=-1),
+    # Rest-density cache — recomputed only when particle_radius changes.
+    last_particle_radius: float = -1.0
+    rest_density:         float = 1.0
+
+    # Performance history for the FPS graph (2 s at 60 fps).
+    fps_history: Deque[float] = field(
+        default_factory=lambda: deque(maxlen=120)
     )
 
+    # Obstacles — fixed-size arrays; unused slots have obs_active[i] == 0.
+    obs_xs:     np.ndarray = field(default_factory=lambda: np.zeros(10, dtype=np.float32))
+    obs_ys:     np.ndarray = field(default_factory=lambda: np.zeros(10, dtype=np.float32))
+    obs_ws:     np.ndarray = field(default_factory=lambda: np.zeros(10, dtype=np.float32))
+    obs_hs:     np.ndarray = field(default_factory=lambda: np.zeros(10, dtype=np.float32))
+    obs_active: np.ndarray = field(default_factory=lambda: np.zeros(10, dtype=np.int32))
+
+    # Mouse interaction state
+    dragging_idx:  int   = -1
+    pushing_water: bool  = False
+    drag_offset_x: float = 0.0
+    drag_offset_y: float = 0.0
+
+    # Values written by _step_physics and read by _render_frame.
+    _particle_radius: float = 2.0
+    _render_radius:   float = 4.0
+    _current_max:     int   = 6000
+
+
 # ---------------------------------------------------------------------------
-# Colour
+# Particle array helpers
 # ---------------------------------------------------------------------------
-def speed_to_color(speed: float) -> tuple:
-    MAX_SPEED = 14.0
-    t = min(speed / MAX_SPEED, 1.0)
+
+def make_particle_arrays(capacity: int) -> tuple:
+    """Allocate a fresh set of per-particle numpy arrays.
+
+    All arrays use float32 to maximise Numba vectorisation and cache
+    efficiency. grid_next is initialised to -1 (end-of-list sentinel).
+
+    Args:
+        capacity: Number of particle slots to allocate.
+
+    Returns:
+        An 8-tuple: (xs, ys, vxs, vys, axs, ays, densities, grid_next).
+    """
+    zeros = lambda: np.zeros(capacity, dtype=np.float32)
+    return (
+        zeros(),                                    # xs
+        zeros(),                                    # ys
+        zeros(),                                    # vxs
+        zeros(),                                    # vys
+        zeros(),                                    # axs
+        zeros(),                                    # ays
+        zeros(),                                    # densities
+        np.full(capacity, -1, dtype=np.int32),      # grid_next
+    )
+
+
+def maybe_grow_arrays(state: SimState) -> None:
+    """Double every particle array in-place if capacity is nearly exhausted.
+
+    Growth is triggered when num_active is within one pour-burst of the
+    array boundary. Without this buffer the pour loop would write past the
+    end of the arrays before the next frame could resize them.
+
+    Doubling strategy amortises allocation cost: at most O(log n) doublings
+    occur over the lifetime of the simulation regardless of final count.
+
+    Mutates state directly — no return value.
+    """
+    if state.num_active + POUR_RATE + 1 < state.capacity:
+        return  # Enough room for at least one more full burst.
+
+    new_capacity = state.capacity * 2
+    print(f"[SPH] Growing particle arrays: {state.capacity:,} -> {new_capacity:,}")
+
+    def _grow(arr: np.ndarray, fill: int = 0) -> np.ndarray:
+        """Return a new array of new_capacity with live data copied in."""
+        grown = np.full(new_capacity, fill, dtype=arr.dtype)
+        grown[:state.capacity] = arr[:state.capacity]
+        return grown
+
+    state.xs        = _grow(state.xs)
+    state.ys        = _grow(state.ys)
+    state.vxs       = _grow(state.vxs)
+    state.vys       = _grow(state.vys)
+    state.axs       = _grow(state.axs)
+    state.ays       = _grow(state.ays)
+    state.densities = _grow(state.densities)
+    state.grid_next = _grow(state.grid_next, fill=-1)
+    state.capacity  = new_capacity
+
+
+# ---------------------------------------------------------------------------
+# Colour helpers
+# ---------------------------------------------------------------------------
+
+def speed_to_heatmap_color(speed: float) -> Tuple[int, int, int]:
+    """Map a particle speed to an RGB colour on a blue to orange ramp.
+
+    Slow particles are cool blue; fast particles are hot orange-red.
+
+    Args:
+        speed: Particle speed in pixels per frame.
+
+    Returns:
+        An (R, G, B) tuple with each component in [0, 255].
+    """
+    t = min(speed / HEATMAP_MAX_SPEED, 1.0)
     if t < 0.33:
         s = t / 0.33
         return (0, int(150 * s + 105), 255)
@@ -139,12 +348,35 @@ def speed_to_color(speed: float) -> tuple:
         s = (t - 0.66) / 0.34
         return (255, int(255 * (1 - s)), 0)
 
+
 # ---------------------------------------------------------------------------
-# UI Classes
+# UI: Slider
 # ---------------------------------------------------------------------------
+
 class Slider:
-    def __init__(self, x, y, w, h, min_val, max_val, initial_val,
-                 text, is_int=False, decimals=1):
+    """A horizontal drag slider for the control panel.
+
+    Supports both continuous float values and integer (snapped) values.
+    The label and current value are rendered directly above the track.
+
+    Attributes:
+        rect:     Bounding rectangle of the slider track.
+        min_val:  Minimum selectable value.
+        max_val:  Maximum selectable value.
+        val:      Current value.
+        text:     Label shown above the slider.
+        is_int:   If True, the value is rounded to the nearest integer.
+        decimals: Decimal places shown when is_int is False.
+    """
+
+    def __init__(
+        self,
+        x: int, y: int, w: int, h: int,
+        min_val: float, max_val: float, initial_val: float,
+        text: str,
+        is_int: bool = False,
+        decimals: int = 1,
+    ) -> None:
         self.rect     = pygame.Rect(x, y, w, h)
         self.min_val  = min_val
         self.max_val  = max_val
@@ -154,7 +386,15 @@ class Slider:
         self.decimals = decimals
         self.dragging = False
 
-    def handle_event(self, event):
+    def handle_event(self, event: pygame.event.Event) -> bool:
+        """Update the slider value from a mouse event.
+
+        Args:
+            event: A Pygame event.
+
+        Returns:
+            True if the event was consumed by this slider.
+        """
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if self.rect.collidepoint(event.pos):
                 self.dragging = True
@@ -162,197 +402,317 @@ class Slider:
         elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
             self.dragging = False
         elif event.type == pygame.MOUSEMOTION and self.dragging:
-            rel_x    = max(0, min(event.pos[0] - self.rect.x, self.rect.width))
-            fraction = rel_x / self.rect.width
-            self.val = self.min_val + fraction * (self.max_val - self.min_val)
+            relative_x = max(0, min(event.pos[0] - self.rect.x, self.rect.width))
+            fraction   = relative_x / self.rect.width
+            self.val   = self.min_val + fraction * (self.max_val - self.min_val)
             if self.is_int:
                 self.val = int(self.val)
             return True
         return False
 
-    def draw(self, screen, font):
+    def draw(self, screen: pygame.Surface, font: pygame.font.Font) -> None:
+        """Render the slider track, handle, and label to screen."""
+        # Track background
         pygame.draw.rect(screen, (40, 50, 70), self.rect, border_radius=4)
-        handle_x = self.rect.x + (
-            (self.val - self.min_val) / (self.max_val - self.min_val)
-        ) * self.rect.width
+
+        # Handle: position maps val linearly onto the track width.
+        t        = (self.val - self.min_val) / (self.max_val - self.min_val)
+        handle_x = self.rect.x + int(t * self.rect.width)
         pygame.draw.circle(
             screen, (200, 220, 255),
-            (int(handle_x), self.rect.centery),
+            (handle_x, self.rect.centery),
             self.rect.height // 2 + 4,
         )
-        val_str = (
-            f"{int(self.val)}"
-            if self.is_int
-            else f"{self.val:.{self.decimals}f}"
-        )
-        txt = font.render(f"{self.text}: {val_str}", True, (220, 230, 255))
-        screen.blit(txt, (self.rect.x, self.rect.y - 22))
 
+        # Label and current value rendered above the track.
+        val_str = f"{int(self.val)}" if self.is_int else f"{self.val:.{self.decimals}f}"
+        label   = font.render(f"{self.text}: {val_str}", True, (220, 230, 255))
+        screen.blit(label, (self.rect.x, self.rect.y - 22))
+
+
+# ---------------------------------------------------------------------------
+# UI: Button
+# ---------------------------------------------------------------------------
 
 class Button:
-    def __init__(self, x, y, w, h, text):
+    """A toggle button for the tab bar at the top of the control panel.
+
+    The active flag controls the highlighted (selected) visual state.
+
+    Attributes:
+        rect:   Bounding rectangle.
+        text:   Label rendered centred in the button.
+        active: Whether this button is currently selected.
+    """
+
+    def __init__(self, x: int, y: int, w: int, h: int, text: str) -> None:
         self.rect   = pygame.Rect(x, y, w, h)
         self.text   = text
         self.active = False
 
-    def draw(self, screen, font):
-        color = (100, 150, 255) if self.active else (60, 70, 90)
-        pygame.draw.rect(screen, color, self.rect, border_radius=4)
+    def draw(self, screen: pygame.Surface, font: pygame.font.Font) -> None:
+        """Render the button, highlighted if active is True."""
+        fill_color = (100, 150, 255) if self.active else (60, 70, 90)
+        pygame.draw.rect(screen, fill_color,      self.rect, border_radius=4)
         pygame.draw.rect(screen, (200, 220, 255), self.rect, 1, border_radius=4)
-        txt = font.render(self.text, True, (255, 255, 255))
-        screen.blit(
-            txt,
-            (
-                self.rect.centerx - txt.get_width()  // 2,
-                self.rect.centery - txt.get_height() // 2,
-            ),
-        )
+        label = font.render(self.text, True, (255, 255, 255))
+        screen.blit(label, (
+            self.rect.centerx - label.get_width()  // 2,
+            self.rect.centery - label.get_height() // 2,
+        ))
 
-    def handle_event(self, event):
+    def handle_event(self, event: pygame.event.Event) -> bool:
+        """Return True if this button was clicked.
+
+        Args:
+            event: A Pygame event.
+        """
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if self.rect.collidepoint(event.pos):
                 return True
         return False
 
-# ---------------------------------------------------------------------------
-# FPS Graph  (Phase 14)
-# ---------------------------------------------------------------------------
-FPS_HISTORY_LEN = 120   # 2 seconds at 60 fps
 
-def draw_fps_graph(screen, font, fps_history, panel_x, panel_y, panel_w, panel_h):
+# ---------------------------------------------------------------------------
+# UI: FPS graph
+# ---------------------------------------------------------------------------
+
+# The green horizontal reference line is drawn at this target FPS value.
+_FPS_TARGET: float = 60.0
+
+
+def draw_fps_graph(
+    screen:      pygame.Surface,
+    font:        pygame.font.Font,
+    fps_history: Deque[float],
+    panel_x: int, panel_y: int,
+    panel_w: int, panel_h: int,
+) -> None:
+    """Draw a filled line graph of recent FPS values inside a panel rectangle.
+
+    The graph scales vertically so the display is stable when running above
+    target. A green dashed line marks 60 fps.
+
+    Args:
+        screen:      Destination surface.
+        font:        Font for the FPS label and current-value readout.
+        fps_history: Ring buffer of recent clock.get_fps() samples.
+        panel_x/y:   Top-left corner of the graph area (pixels).
+        panel_w/h:   Width and height of the graph area (pixels).
     """
-    Draws a filled line graph of recent FPS values at the bottom of the UI panel.
-    panel_x/y = top-left corner of the graph area, panel_w/h = its size.
-    """
+    history_len = fps_history.maxlen or 120
+
+    # Background and border.
     bg_rect = pygame.Rect(panel_x, panel_y, panel_w, panel_h)
     pygame.draw.rect(screen, (15, 20, 32), bg_rect, border_radius=4)
-    pygame.draw.rect(screen, (40, 55, 80), bg_rect, 1, border_radius=4)
-
-    label = font.render("FPS", True, (80, 110, 160))
-    screen.blit(label, (panel_x + 4, panel_y + 4))
+    pygame.draw.rect(screen, (40, 55, 80), bg_rect, 1,  border_radius=4)
+    screen.blit(font.render("FPS", True, (80, 110, 160)), (panel_x + 4, panel_y + 4))
 
     history = list(fps_history)
     if len(history) < 2:
         return
 
-    max_fps   = max(max(history), 60.0)
-    graph_top = panel_y + 20
-    graph_h   = panel_h - 24
-    graph_w   = panel_w - 8
+    max_fps  = max(max(history), _FPS_TARGET)
+    graph_h  = panel_h - 24
+    graph_w  = panel_w - 8
+    baseline = panel_y + panel_h - 4
 
-    # Build polyline points
-    points = []
-    for i, f in enumerate(history):
-        x = panel_x + 4 + int(i / (FPS_HISTORY_LEN - 1) * graph_w)
-        y = panel_y + panel_h - 4 - int((f / max_fps) * graph_h)
-        points.append((x, y))
+    # Build a polyline from the ring buffer, oldest sample on the left.
+    points = [
+        (
+            panel_x + 4 + int(i / (history_len - 1) * graph_w),
+            panel_y + panel_h - 4 - int((f / max_fps) * graph_h),
+        )
+        for i, f in enumerate(history)
+    ]
 
-    # Filled area under the curve
-    if len(points) >= 2:
-        baseline = panel_y + panel_h - 4
-        poly = [points[0]] + points + [(points[-1][0], baseline), (points[0][0], baseline)]
-        fill_surf = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
-        local_poly = [(px - panel_x, py - panel_y) for px, py in poly]
-        pygame.draw.polygon(fill_surf, (40, 100, 200, 60), local_poly)
-        screen.blit(fill_surf, (panel_x, panel_y))
-        pygame.draw.lines(screen, (80, 160, 255), False, points, 1)
+    # Filled area under the curve (semi-transparent blue).
+    fill_poly  = [points[0]] + points + [(points[-1][0], baseline), (points[0][0], baseline)]
+    fill_surf  = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+    local_poly = [(px - panel_x, py - panel_y) for px, py in fill_poly]
+    pygame.draw.polygon(fill_surf, (40, 100, 200, 60), local_poly)
+    screen.blit(fill_surf, (panel_x, panel_y))
+    pygame.draw.lines(screen, (80, 160, 255), False, points, 1)
 
-    # Current FPS label (right-aligned)
-    cur = font.render(f"{history[-1]:.0f}", True, (140, 200, 255))
-    screen.blit(cur, (panel_x + panel_w - cur.get_width() - 4, panel_y + 4))
+    # Current FPS readout, right-aligned inside the panel.
+    cur_label = font.render(f"{history[-1]:.0f}", True, (140, 200, 255))
+    screen.blit(cur_label, (panel_x + panel_w - cur_label.get_width() - 4, panel_y + 4))
 
-    # 60 FPS target line
-    target_y = panel_y + panel_h - 4 - int((60.0 / max_fps) * graph_h)
-    if graph_top <= target_y <= panel_y + panel_h:
+    # 60 fps target reference line.
+    target_y = panel_y + panel_h - 4 - int((_FPS_TARGET / max_fps) * graph_h)
+    if (panel_y + 20) <= target_y <= (panel_y + panel_h):
         pygame.draw.line(
             screen, (60, 120, 60),
-            (panel_x + 4, target_y),
+            (panel_x + 4,           target_y),
             (panel_x + panel_w - 4, target_y),
             1,
         )
 
+
 # ---------------------------------------------------------------------------
-# Numba Math Kernels
+# Numba SPH kernels  (notation: h = smoothing radius, d = inter-particle dist)
 # ---------------------------------------------------------------------------
+
 @njit
 def kernel(h: float, d: float) -> float:
-    if d >= h: return 0.0
+    """Poly6 smoothing kernel W(h, d).
+
+    Returns the weight of a neighbour at distance d within smoothing radius h.
+    The cubic fall-off gives a smooth zero derivative at the boundary,
+    avoiding discontinuous forces near the edge of the neighbourhood.
+    """
+    if d >= h:
+        return 0.0
     q = 1.0 - (d / h) ** 2
     return q * q * q
 
+
 @njit
 def kernel_grad(h: float, d: float) -> float:
-    if d >= h or d < 1e-6: return 0.0
+    """Radial gradient of the Poly6 kernel: dW/dd.
+
+    Used in the pressure force accumulation. The negative sign means the
+    gradient points inward, so subtracting it in the pressure loop correctly
+    produces a repulsive force.
+    """
+    if d >= h or d < 1e-6:
+        return 0.0
     q = 1.0 - (d / h) ** 2
     return -6.0 * d / (h * h) * q * q
 
+
 @njit
 def kernel_laplacian(h: float, d: float) -> float:
-    if d >= h: return 0.0
+    """Laplacian of the Poly6 kernel: nabla^2 W(h, d).
+
+    Used by the surface-tension pass to measure the curvature of the
+    colour field at each surface particle.
+    """
+    if d >= h:
+        return 0.0
     h2 = h * h
     d2 = d * d
     q  = 1.0 - d2 / h2
     return (24.0 / h2) * q * (4.0 * d2 / h2 - q)
 
+
 @njit
-def calibrate_rest_density(h: float, r_part: float, mass: float) -> float:
-    spacing = r_part * 2.2
+def calibrate_rest_density(h: float, particle_radius: float, mass: float) -> float:
+    """Compute the equilibrium density for a fully-surrounded particle.
+
+    Samples a regular grid of phantom neighbours at the natural packing
+    spacing (2.2 * radius) and sums their kernel contributions. This gives
+    the density that a particle should have when surrounded by peers, so
+    the pressure equation produces zero force at equilibrium.
+
+    Args:
+        h:               Smoothing radius.
+        particle_radius: Radius of a single particle.
+        mass:            Particle mass (= radius^2).
+
+    Returns:
+        The rest (equilibrium) density rho_0.
+    """
+    spacing = particle_radius * 2.2
     total   = 0.0
-    r       = int(h / spacing) + 1
-    for ix in range(-r, r + 1):
-        for iy in range(-r, r + 1):
+    grid_r  = int(h / spacing) + 1
+    for ix in range(-grid_r, grid_r + 1):
+        for iy in range(-grid_r, grid_r + 1):
             d = math.hypot(ix * spacing, iy * spacing)
             total += mass * kernel(h, d)
     return max(total, 0.001)
 
+
 # ---------------------------------------------------------------------------
-# Numba SPH Passes
+# Numba SPH simulation passes
 # ---------------------------------------------------------------------------
+
 @njit
-def build_grid(xs, ys, num_active, h, grid_cols, grid_rows, grid_head, grid_next):
+def build_grid(
+    xs: np.ndarray, ys: np.ndarray, num_active: int,
+    h: float, grid_cols: int, grid_rows: int,
+    grid_head: np.ndarray, grid_next: np.ndarray,
+) -> None:
+    """Insert all active particles into the spatial hash grid.
+
+    Uses a linked-list per cell: grid_head[cx, cy] is the index of the first
+    particle in that cell; grid_next[i] chains to the next particle in the
+    same cell (-1 = end of list).
+
+    Only clearing grid_next[:num_active] (not the whole array) avoids an
+    O(capacity) fill on every frame.
+    """
     grid_head.fill(-1)
     grid_next[:num_active] = -1
     for i in range(num_active):
         cx = int(xs[i] // h)
         cy = int(ys[i] // h)
         if 0 <= cx < grid_cols and 0 <= cy < grid_rows:
-            grid_next[i]       = grid_head[cx, cy]
-            grid_head[cx, cy]  = i
+            grid_next[i]      = grid_head[cx, cy]  # Push onto front of list.
+            grid_head[cx, cy] = i
+
 
 @njit(parallel=True)
-def compute_densities(xs, ys, densities, num_active, h, mass,
-                      grid_cols, grid_rows, grid_head, grid_next):
+def compute_densities(
+    xs: np.ndarray, ys: np.ndarray,
+    densities: np.ndarray, num_active: int,
+    h: float, mass: float,
+    grid_cols: int, grid_rows: int,
+    grid_head: np.ndarray, grid_next: np.ndarray,
+) -> None:
+    """Estimate SPH density at each particle: rho_i = sum_j m*W(h, |r_i - r_j|).
+
+    Each particle sums kernel contributions of its neighbours. Only the 3x3
+    cells surrounding particle i's own cell need to be checked because
+    W(h, d) = 0 for d >= h and each cell has side-length h.
+    """
     h2 = h * h
     for i in prange(num_active):
         rho = 0.0
         cx  = int(xs[i] // h)
         cy  = int(ys[i] // h)
-        for dx in range(-1, 2):
-            for dy in range(-1, 2):
-                nx = cx + dx
-                ny = cy + dy
+        for dcx in range(-1, 2):
+            for dcy in range(-1, 2):
+                nx = cx + dcx
+                ny = cy + dcy
                 if 0 <= nx < grid_cols and 0 <= ny < grid_rows:
                     j = grid_head[nx, ny]
                     while j != -1:
-                        dist2 = (xs[i] - xs[j])**2 + (ys[i] - ys[j])**2
+                        dist2 = (xs[i] - xs[j]) ** 2 + (ys[i] - ys[j]) ** 2
                         if dist2 < h2:
                             rho += mass * kernel(h, math.sqrt(dist2))
                         j = grid_next[j]
-        densities[i] = max(rho, 1e-4)
+        densities[i] = max(rho, 1e-4)  # Floor prevents division by zero downstream.
+
 
 @njit(parallel=True)
-def apply_pressure(xs, ys, axs, ays, densities, num_active, h, mass,
-                   stiffness, rest_density,
-                   grid_cols, grid_rows, grid_head, grid_next):
+def apply_pressure(
+    xs: np.ndarray, ys: np.ndarray,
+    axs: np.ndarray, ays: np.ndarray,
+    densities: np.ndarray, num_active: int,
+    h: float, mass: float,
+    stiffness: float, rest_density: float,
+    grid_cols: int, grid_rows: int,
+    grid_head: np.ndarray, grid_next: np.ndarray,
+) -> None:
+    """Accumulate pressure forces onto each particle.
+
+    Pressure equation (linear): p_i = max(k * (rho_i - rho_0), 0).
+    The max(0) clamp means only compression creates repulsion — no tension.
+
+    Force: a_i -= sum_j  m*(p_i+p_j)/(2*rho_j) * grad_W * r_hat_ij.
+    Averaging pressures symmetrises the interaction so Newton's 3rd law is
+    approximately preserved.
+    """
     h2 = h * h
     for i in prange(num_active):
-        pres_i = max(stiffness * (densities[i] - rest_density), 0.0)
+        pressure_i = max(stiffness * (densities[i] - rest_density), 0.0)
         cx = int(xs[i] // h)
         cy = int(ys[i] // h)
-        for dx_ in range(-1, 2):
-            for dy_ in range(-1, 2):
-                nx = cx + dx_
-                ny = cy + dy_
+        for dcx in range(-1, 2):
+            for dcy in range(-1, 2):
+                nx = cx + dcx
+                ny = cy + dcy
                 if 0 <= nx < grid_cols and 0 <= ny < grid_rows:
                     j = grid_head[nx, ny]
                     while j != -1:
@@ -361,107 +721,180 @@ def apply_pressure(xs, ys, axs, ays, densities, num_active, h, mass,
                             dy = ys[i] - ys[j]
                             d2 = dx * dx + dy * dy
                             if 1e-10 < d2 < h2:
-                                d      = math.sqrt(d2)
-                                pres_j = max(stiffness * (densities[j] - rest_density), 0.0)
-                                grad   = kernel_grad(h, d)
-                                shared = (
-                                    0.5 * mass * (pres_i + pres_j)
-                                    / (2.0 * densities[j] + 1e-6) * grad
+                                d          = math.sqrt(d2)
+                                pressure_j = max(stiffness * (densities[j] - rest_density), 0.0)
+                                grad       = kernel_grad(h, d)
+                                f_shared   = (
+                                    0.5 * mass * (pressure_i + pressure_j)
+                                    / (2.0 * densities[j] + 1e-6)
+                                    * grad
                                 )
-                                axs[i] -= shared * (dx / d)
-                                ays[i] -= shared * (dy / d)
+                                axs[i] -= f_shared * (dx / d)
+                                ays[i] -= f_shared * (dy / d)
                         j = grid_next[j]
 
+
 @njit(parallel=True)
-def apply_viscosity(xs, ys, vxs, vys, densities, num_active, h, mass, viscosity,
-                    grid_cols, grid_rows, grid_head, grid_next):
+def apply_viscosity(
+    xs: np.ndarray, ys: np.ndarray,
+    vxs: np.ndarray, vys: np.ndarray,
+    densities: np.ndarray, num_active: int,
+    h: float, mass: float, viscosity: float,
+    grid_cols: int, grid_rows: int,
+    grid_head: np.ndarray, grid_next: np.ndarray,
+) -> None:
+    """Smooth velocity differences between neighbouring particles.
+
+    delta_v_i = sum_j (v_j - v_i) * m * W(h,d) / rho_j;  v_i += mu * delta_v_i.
+
+    This is a velocity-averaging (XSPH variant) rather than a true Laplacian
+    viscosity, but it is cheaper and stable at the timestep used here.
+    Higher mu produces a thicker, more honey-like fluid.
+    """
     h2 = h * h
     for i in prange(num_active):
-        dvx, dvy = 0.0, 0.0
+        dv_x, dv_y = 0.0, 0.0
         cx = int(xs[i] // h)
         cy = int(ys[i] // h)
-        for dx_ in range(-1, 2):
-            for dy_ in range(-1, 2):
-                nx = cx + dx_
-                ny = cy + dy_
+        for dcx in range(-1, 2):
+            for dcy in range(-1, 2):
+                nx = cx + dcx
+                ny = cy + dcy
                 if 0 <= nx < grid_cols and 0 <= ny < grid_rows:
                     j = grid_head[nx, ny]
                     while j != -1:
                         if i != j:
-                            dx = xs[j] - xs[i]
-                            dy = ys[j] - ys[i]
-                            d2 = dx * dx + dy * dy
+                            rx = xs[j] - xs[i]
+                            ry = ys[j] - ys[i]
+                            d2 = rx * rx + ry * ry
                             if d2 < h2:
                                 d    = math.sqrt(d2)
                                 coef = mass * kernel(h, d) / (densities[j] + 1e-6)
-                                dvx += (vxs[j] - vxs[i]) * coef
-                                dvy += (vys[j] - vys[i]) * coef
+                                dv_x += (vxs[j] - vxs[i]) * coef
+                                dv_y += (vys[j] - vys[i]) * coef
                         j = grid_next[j]
-        vxs[i] += viscosity * dvx
-        vys[i] += viscosity * dvy
+        vxs[i] += viscosity * dv_x
+        vys[i] += viscosity * dv_y
+
 
 @njit(parallel=True)
-def apply_surface_tension(xs, ys, axs, ays, densities, num_active, h, mass,
-                          surface_tension, cutoff,
-                          grid_cols, grid_rows, grid_head, grid_next):
-    h2        = h * h
-    threshold = 0.3
+def apply_surface_tension(
+    xs: np.ndarray, ys: np.ndarray,
+    axs: np.ndarray, ays: np.ndarray,
+    densities: np.ndarray, num_active: int,
+    h: float, mass: float,
+    surface_tension: float, cutoff_density: float,
+    grid_cols: int, grid_rows: int,
+    grid_head: np.ndarray, grid_next: np.ndarray,
+) -> None:
+    """Apply a cohesion force to particles near the fluid surface.
+
+    Uses the colour-field method (Muller et al. 2003): treat the fluid as a
+    scalar field C = 1 inside, 0 outside. At the surface grad(C) points
+    outward and nabla^2(C) measures curvature. The force
+        a_i -= sigma * nabla^2(C) * (grad(C) / |grad(C)|)
+    pulls surface particles inward, creating a surface-tension-like effect.
+
+    Only particles with density below cutoff_density are considered surface
+    particles; interior particles skip this pass entirely.
+
+    A minimum gradient magnitude guard suppresses the force at isolated
+    particles where the gradient direction is numerically unreliable.
+    """
+    _MIN_GRADIENT = 0.3  # Suppress force when gradient direction is unreliable.
+    h2 = h * h
     for i in prange(num_active):
-        if densities[i] > cutoff:
-            continue
-        gcx, gcy, lap = 0.0, 0.0, 0.0
+        if densities[i] > cutoff_density:
+            continue  # Interior particle — skip.
+
+        grad_cx, grad_cy, laplacian = 0.0, 0.0, 0.0
         cx = int(xs[i] // h)
         cy = int(ys[i] // h)
-        for dx_ in range(-1, 2):
-            for dy_ in range(-1, 2):
-                nx = cx + dx_
-                ny = cy + dy_
+        for dcx in range(-1, 2):
+            for dcy in range(-1, 2):
+                nx = cx + dcx
+                ny = cy + dcy
                 if 0 <= nx < grid_cols and 0 <= ny < grid_rows:
                     j = grid_head[nx, ny]
                     while j != -1:
                         if i != j:
-                            dx = xs[j] - xs[i]
-                            dy = ys[j] - ys[i]
-                            d2 = dx * dx + dy * dy
+                            rx = xs[j] - xs[i]
+                            ry = ys[j] - ys[i]
+                            d2 = rx * rx + ry * ry
                             if 1e-6 < d2 < h2:
-                                d    = math.sqrt(d2)
-                                coef = mass / (densities[j] + 1e-6)
-                                g    = kernel_grad(h, d)
-                                gcx += coef * g * (dx / d)
-                                gcy += coef * g * (dy / d)
-                                lap += coef * kernel_laplacian(h, d)
+                                d          = math.sqrt(d2)
+                                coef       = mass / (densities[j] + 1e-6)
+                                g          = kernel_grad(h, d)
+                                grad_cx   += coef * g * (rx / d)
+                                grad_cy   += coef * g * (ry / d)
+                                laplacian += coef * kernel_laplacian(h, d)
                         j = grid_next[j]
-        gm = math.hypot(gcx, gcy)
-        if gm > threshold:
-            axs[i] -= surface_tension * lap * gcx / gm
-            ays[i] -= surface_tension * lap * gcy / gm
+
+        grad_mag = math.hypot(grad_cx, grad_cy)
+        if grad_mag > _MIN_GRADIENT:
+            axs[i] -= surface_tension * laplacian * grad_cx / grad_mag
+            ays[i] -= surface_tension * laplacian * grad_cy / grad_mag
+
 
 @njit(parallel=True)
-def integrate(xs, ys, vxs, vys, axs, ays, num_active, gravity):
+def integrate(
+    xs: np.ndarray, ys: np.ndarray,
+    vxs: np.ndarray, vys: np.ndarray,
+    axs: np.ndarray, ays: np.ndarray,
+    num_active: int,
+    gravity: float,
+) -> None:
+    """Advance positions and velocities by one timestep (semi-implicit Euler).
+
+    Integration order: velocity is updated first from accumulated acceleration,
+    then position is updated from the new velocity. This is "symplectic" Euler
+    which conserves energy better than explicit Euler for oscillatory systems.
+
+    After integration, acceleration is reset to zero except for gravity,
+    which is loaded into ays so it acts as a constant body force next frame.
+
+    A speed clamp prevents particles from moving more than MAX_PARTICLE_SPEED
+    pixels per frame, which would otherwise cause tunnelling through walls.
+    """
     for i in prange(num_active):
         vxs[i] += axs[i]
         vys[i] += ays[i]
+
+        # Clamp speed — scale both components uniformly to preserve direction.
         spd = math.hypot(vxs[i], vys[i])
-        if spd > 25.0:
-            f = 25.0 / spd
-            vxs[i] *= f
-            vys[i] *= f
+        if spd > MAX_PARTICLE_SPEED:
+            scale   = MAX_PARTICLE_SPEED / spd
+            vxs[i] *= scale
+            vys[i] *= scale
+
         xs[i] += vxs[i]
         ys[i] += vys[i]
-        axs[i] = 0.0
-        ays[i] = gravity
+
+        axs[i] = 0.0      # Reset for next frame.
+        ays[i] = gravity  # Gravity is the only persistent body force.
+
 
 @njit(parallel=True)
-def resolve_overlaps(xs, ys, num_active, h, diam,
-                     grid_cols, grid_rows, grid_head, grid_next):
-    diam2 = diam * diam
+def resolve_overlaps(
+    xs: np.ndarray, ys: np.ndarray,
+    num_active: int, h: float, particle_diameter: float,
+    grid_cols: int, grid_rows: int,
+    grid_head: np.ndarray, grid_next: np.ndarray,
+) -> None:
+    """Push overlapping particle pairs apart by half the overlap each.
+
+    This positional correction pass runs after integration to prevent
+    persistent inter-penetration. Each particle is nudged outward by its
+    share of the overlap, keeping the correction symmetric.
+    """
+    diam2 = particle_diameter * particle_diameter
     for i in prange(num_active):
         cx = int(xs[i] // h)
         cy = int(ys[i] // h)
-        for dx_ in range(-1, 2):
-            for dy_ in range(-1, 2):
-                nx = cx + dx_
-                ny = cy + dy_
+        for dcx in range(-1, 2):
+            for dcy in range(-1, 2):
+                nx = cx + dcx
+                ny = cy + dcy
                 if 0 <= nx < grid_cols and 0 <= ny < grid_rows:
                     j = grid_head[nx, ny]
                     while j != -1:
@@ -470,135 +903,245 @@ def resolve_overlaps(xs, ys, num_active, h, diam,
                             dy = ys[i] - ys[j]
                             d2 = dx * dx + dy * dy
                             if 1e-10 < d2 < diam2:
-                                d       = math.sqrt(d2)
-                                overlap = (diam - d) * 0.5
-                                xs[i]  += (dx / d) * overlap
-                                ys[i]  += (dy / d) * overlap
+                                d      = math.sqrt(d2)
+                                push   = (particle_diameter - d) * 0.5
+                                xs[i] += (dx / d) * push
+                                ys[i] += (dy / d) * push
                         j = grid_next[j]
 
+
 @njit(parallel=True)
-def apply_mouse_push(xs, ys, vxs, vys, num_active,
-                     mx, my, mouse_radius, mouse_strength):
-    mr2 = mouse_radius * mouse_radius
+def apply_mouse_push(
+    xs: np.ndarray, ys: np.ndarray,
+    vxs: np.ndarray, vys: np.ndarray,
+    num_active: int,
+    cursor_x: float, cursor_y: float,
+    push_radius: float, push_strength: float,
+) -> None:
+    """Apply a radial impulse to particles near the cursor position.
+
+    Force falls off linearly from push_strength at the cursor to zero at
+    push_radius. Particles outside the radius are unaffected.
+    """
+    radius2 = push_radius * push_radius
     for i in prange(num_active):
-        dx = xs[i] - mx
-        dy = ys[i] - my
+        dx = xs[i] - cursor_x
+        dy = ys[i] - cursor_y
         d2 = dx * dx + dy * dy
-        if 0 < d2 < mr2:
-            d      = math.sqrt(d2)
-            f      = (1.0 - d / mouse_radius) * mouse_strength
-            vxs[i] += (dx / d) * f
-            vys[i] += (dy / d) * f
+        if 0 < d2 < radius2:
+            d       = math.sqrt(d2)
+            impulse = (1.0 - d / push_radius) * push_strength
+            vxs[i] += (dx / d) * impulse
+            vys[i] += (dy / d) * impulse
+
 
 @njit(parallel=True)
-def resolve_flask(xs, ys, vxs, vys, num_active, r, wf, res,
-                  f_left, f_right, f_top, f_bot):
+def resolve_flask(
+    xs: np.ndarray, ys: np.ndarray,
+    vxs: np.ndarray, vys: np.ndarray,
+    num_active: int,
+    particle_radius: float,
+    wall_friction: float,
+    restitution: float,
+    f_left: float, f_right: float, f_top: float, f_bot: float,
+) -> None:
+    """Clamp particles inside the flask boundaries and reflect wall velocity.
+
+    On impact the normal velocity component is reversed and scaled by
+    restitution (0 = fully inelastic, 1 = perfectly elastic). The tangential
+    component is damped by wall_friction to simulate surface drag.
+    """
     for i in prange(num_active):
-        if xs[i] < f_left + r:
-            xs[i] = f_left + r
-            if vxs[i] < 0: vxs[i] = -vxs[i] * res
-            vys[i] *= (1.0 - wf)
-        if xs[i] > f_right - r:
-            xs[i] = f_right - r
-            if vxs[i] > 0: vxs[i] = -vxs[i] * res
-            vys[i] *= (1.0 - wf)
-        if ys[i] > f_bot - r:
-            ys[i] = f_bot - r
-            if vys[i] > 0: vys[i] = -vys[i] * res
-            vxs[i] *= (1.0 - wf)
-        if ys[i] < r:
-            ys[i] = r
-            if vys[i] < 0: vys[i] = -vys[i] * res
+        # Left wall
+        if xs[i] < f_left + particle_radius:
+            xs[i] = f_left + particle_radius
+            if vxs[i] < 0:
+                vxs[i] = -vxs[i] * restitution
+            vys[i] *= (1.0 - wall_friction)
+
+        # Right wall
+        if xs[i] > f_right - particle_radius:
+            xs[i] = f_right - particle_radius
+            if vxs[i] > 0:
+                vxs[i] = -vxs[i] * restitution
+            vys[i] *= (1.0 - wall_friction)
+
+        # Floor
+        if ys[i] > f_bot - particle_radius:
+            ys[i] = f_bot - particle_radius
+            if vys[i] > 0:
+                vys[i] = -vys[i] * restitution
+            vxs[i] *= (1.0 - wall_friction)
+
+        # Ceiling — prevents escape above the flask opening.
+        if ys[i] < particle_radius:
+            ys[i] = particle_radius
+            if vys[i] < 0:
+                vys[i] = -vys[i] * restitution
+
 
 @njit(parallel=True)
-def resolve_obstacles(xs, ys, vxs, vys, num_active, r,
-                      obs_xs, obs_ys, obs_ws, obs_hs, obs_active, res, wf):
+def resolve_obstacles(
+    xs: np.ndarray, ys: np.ndarray,
+    vxs: np.ndarray, vys: np.ndarray,
+    num_active: int,
+    particle_radius: float,
+    obs_xs: np.ndarray, obs_ys: np.ndarray,
+    obs_ws: np.ndarray, obs_hs: np.ndarray,
+    obs_active: np.ndarray,
+    restitution: float,
+    wall_friction: float,
+) -> None:
+    """Resolve collisions between particles and axis-aligned box obstacles.
+
+    For each particle inside an obstacle's expanded bounding box, the
+    shortest escape direction is chosen (minimum penetration depth among
+    the four faces) and the particle is pushed to that face. The velocity
+    component into the face is reflected and scaled by restitution; the
+    tangential component is damped by friction.
+    """
     for i in prange(num_active):
         px = xs[i]
         py = ys[i]
         for o in range(len(obs_active)):
-            if obs_active[o] == 1:
-                ox = obs_xs[o]
-                oy = obs_ys[o]
-                ow = obs_ws[o]
-                oh = obs_hs[o]
-                if px > ox - r and px < ox + ow + r and py > oy - r and py < oy + oh + r:
-                    dist_left   = px - (ox - r)
-                    dist_right  = (ox + ow + r) - px
-                    dist_top    = py - (oy - r)
-                    dist_bottom = (oy + oh + r) - py
-                    min_dist    = min(dist_left, dist_right, dist_top, dist_bottom)
-                    if min_dist == dist_left:
-                        xs[i] = ox - r
-                        if vxs[i] > 0: vxs[i] = -vxs[i] * res
-                        vys[i] *= (1.0 - wf)
-                    elif min_dist == dist_right:
-                        xs[i] = ox + ow + r
-                        if vxs[i] < 0: vxs[i] = -vxs[i] * res
-                        vys[i] *= (1.0 - wf)
-                    elif min_dist == dist_top:
-                        ys[i] = oy - r
-                        if vys[i] > 0: vys[i] = -vys[i] * res
-                        vxs[i] *= (1.0 - wf)
-                    elif min_dist == dist_bottom:
-                        ys[i] = oy + oh + r
-                        if vys[i] < 0: vys[i] = -vys[i] * res
-                        vxs[i] *= (1.0 - wf)
+            if obs_active[o] != 1:
+                continue
+
+            ox, oy = obs_xs[o], obs_ys[o]
+            ow, oh = obs_ws[o], obs_hs[o]
+
+            # Test centre-point overlap with the obstacle expanded by particle_radius.
+            inside = (
+                ox - particle_radius < px < ox + ow + particle_radius
+                and oy - particle_radius < py < oy + oh + particle_radius
+            )
+            if not inside:
+                continue
+
+            # Depth from each face — smallest depth is the escape direction.
+            d_left   = px - (ox - particle_radius)
+            d_right  = (ox + ow + particle_radius) - px
+            d_top    = py - (oy - particle_radius)
+            d_bottom = (oy + oh + particle_radius) - py
+            min_d    = min(d_left, d_right, d_top, d_bottom)
+
+            if min_d == d_left:
+                xs[i] = ox - particle_radius
+                if vxs[i] > 0:
+                    vxs[i] = -vxs[i] * restitution
+                vys[i] *= (1.0 - wall_friction)
+            elif min_d == d_right:
+                xs[i] = ox + ow + particle_radius
+                if vxs[i] < 0:
+                    vxs[i] = -vxs[i] * restitution
+                vys[i] *= (1.0 - wall_friction)
+            elif min_d == d_top:
+                ys[i] = oy - particle_radius
+                if vys[i] > 0:
+                    vys[i] = -vys[i] * restitution
+                vxs[i] *= (1.0 - wall_friction)
+            else:  # d_bottom
+                ys[i] = oy + oh + particle_radius
+                if vys[i] < 0:
+                    vys[i] = -vys[i] * restitution
+                vxs[i] *= (1.0 - wall_friction)
+
 
 # ---------------------------------------------------------------------------
-# Numba Metaball Renderer
+# Numba metaball renderer
 # ---------------------------------------------------------------------------
+
 @njit(parallel=True)
-def compute_metaballs(xs, ys, vxs, vys, num_active, lw, lh, scale,
-                      r_render, threshold, f_left, f_right, f_bot,
-                      obs_xs, obs_ys, obs_ws, obs_hs, obs_active):
-    grid    = np.zeros((lw, lh), dtype=np.float32)
-    vx_grid = np.zeros((lw, lh), dtype=np.float32)
-    vy_grid = np.zeros((lw, lh), dtype=np.float32)
-    r_sq    = r_render * r_render
+def compute_metaballs(
+    xs: np.ndarray, ys: np.ndarray,
+    vxs: np.ndarray, vys: np.ndarray,
+    num_active: int,
+    render_w: int, render_h: int,
+    render_scale: int,
+    render_radius: float,
+    threshold: float,
+    f_left: float, f_right: float, f_bot: float,
+    obs_xs: np.ndarray, obs_ys: np.ndarray,
+    obs_ws: np.ndarray, obs_hs: np.ndarray,
+    obs_active: np.ndarray,
+) -> np.ndarray:
+    """Render particles as a metaball field and return an RGB pixel array.
 
+    Each particle splats a radial weight function onto a downscaled grid.
+    Pixels whose accumulated weight exceeds threshold are coloured by the
+    average velocity of contributing particles (speed maps to hue). Pixels
+    outside the flask or inside an obstacle get the background colour.
+
+    The splat weight function is w = (1 - d^2/r^2)^2, which is smooth,
+    non-negative, and zero at d = render_radius.
+
+    Args:
+        render_w/h:    Grid dimensions (= screen size / render_scale).
+        render_scale:  Downscale factor (higher = faster, blurrier).
+        render_radius: Splat radius in grid pixels.
+        threshold:     Minimum field weight for a pixel to count as fluid.
+
+    Returns:
+        A (render_w, render_h, 3) uint8 array of RGB values.
+    """
+    weight_grid = np.zeros((render_w, render_h), dtype=np.float32)
+    vx_grid     = np.zeros((render_w, render_h), dtype=np.float32)
+    vy_grid     = np.zeros((render_w, render_h), dtype=np.float32)
+    r_sq        = render_radius * render_radius
+
+    # Splat pass: accumulate weight and velocity for each particle.
     for i in range(num_active):
-        px = xs[i] / scale
-        py = ys[i] / scale
-        min_x = max(0,      int(px - r_render))
-        max_x = min(lw - 1, int(px + r_render))
-        min_y = max(0,      int(py - r_render))
-        max_y = min(lh - 1, int(py + r_render))
-        for x in range(min_x, max_x + 1):
-            for y in range(min_y, max_y + 1):
-                dx = px - x
-                dy = py - y
+        px = xs[i] / render_scale
+        py = ys[i] / render_scale
+
+        # Iterate only over the pixel patch within the splat radius.
+        min_x = max(0,            int(px - render_radius))
+        max_x = min(render_w - 1, int(px + render_radius))
+        min_y = max(0,            int(py - render_radius))
+        max_y = min(render_h - 1, int(py + render_radius))
+
+        for gx in range(min_x, max_x + 1):
+            for gy in range(min_y, max_y + 1):
+                dx = px - gx
+                dy = py - gy
                 d2 = dx * dx + dy * dy
                 if d2 < r_sq:
-                    w          = (1.0 - d2 / r_sq) ** 2
-                    grid[x, y]    += w
-                    vx_grid[x, y] += vxs[i] * w
-                    vy_grid[x, y] += vys[i] * w
+                    w = (1.0 - d2 / r_sq) ** 2
+                    weight_grid[gx, gy] += w
+                    vx_grid[gx, gy]     += vxs[i] * w
+                    vy_grid[gx, gy]     += vys[i] * w
 
-    pixels = np.zeros((lw, lh, 3), dtype=np.uint8)
-    for x in prange(lw):
-        for y in range(lh):
-            sx = x * scale
-            sy = y * scale
-            inside_flask = sx >= f_left and sx <= f_right and sy <= f_bot
-            inside_box   = False
+    # Shading pass: map field weight and average velocity to colour.
+    pixels = np.zeros((render_w, render_h, 3), dtype=np.uint8)
+    for gx in prange(render_w):
+        for gy in range(render_h):
+            screen_x = gx * render_scale
+            screen_y = gy * render_scale
+
+            inside_flask = f_left <= screen_x <= f_right and screen_y <= f_bot
+
+            inside_obstacle = False
             for o in range(len(obs_active)):
                 if obs_active[o] == 1:
-                    if (sx > obs_xs[o] and sx < obs_xs[o] + obs_ws[o]
-                            and sy > obs_ys[o] and sy < obs_ys[o] + obs_hs[o]):
-                        inside_box = True
+                    if (obs_xs[o] < screen_x < obs_xs[o] + obs_ws[o]
+                            and obs_ys[o] < screen_y < obs_ys[o] + obs_hs[o]):
+                        inside_obstacle = True
                         break
-            if not inside_flask or inside_box:
-                pixels[x, y, 0] = 8
-                pixels[x, y, 1] = 12
-                pixels[x, y, 2] = 24
+
+            if not inside_flask or inside_obstacle:
+                pixels[gx, gy, 0] = 8
+                pixels[gx, gy, 1] = 12
+                pixels[gx, gy, 2] = 24
                 continue
-            val = grid[x, y]
-            if val > threshold:
-                vx  = vx_grid[x, y] / val
-                vy  = vy_grid[x, y] / val
-                spd = math.hypot(vx, vy)
-                t   = min(spd / 12.0, 1.0)
+
+            w = weight_grid[gx, gy]
+            if w > threshold:
+                avg_vx = vx_grid[gx, gy] / w
+                avg_vy = vy_grid[gx, gy] / w
+                spd    = math.hypot(avg_vx, avg_vy)
+                t      = min(spd / METABALL_COLOR_SPEED, 1.0)
+
+                # Two-stage speed-to-colour ramp: slow = dark blue, fast = cyan/white.
                 if t < 0.5:
                     s = t * 2.0
                     r = int(10 + 20  * s)
@@ -609,379 +1152,597 @@ def compute_metaballs(xs, ys, vxs, vys, num_active, lw, lh, scale,
                     r = int(30  + 170 * s)
                     g = int(120 + 110 * s)
                     b = int(220 + 35  * s)
-                if val < threshold + 0.2:
+
+                # Brighten pixels near the surface to create a specular rim.
+                if w < threshold + 0.2:
                     r = min(255, r + 40)
                     g = min(255, g + 50)
                     b = min(255, b + 60)
-                pixels[x, y, 0] = r
-                pixels[x, y, 1] = g
-                pixels[x, y, 2] = b
+
+                pixels[gx, gy, 0] = r
+                pixels[gx, gy, 1] = g
+                pixels[gx, gy, 2] = b
             else:
-                pixels[x, y, 0] = 8
-                pixels[x, y, 1] = 12
-                pixels[x, y, 2] = 24
+                pixels[gx, gy, 0] = 8
+                pixels[gx, gy, 1] = 12
+                pixels[gx, gy, 2] = 24
+
     return pixels
 
+
 # ---------------------------------------------------------------------------
-# Graphics Helpers
+# Rendering helpers
 # ---------------------------------------------------------------------------
-def draw_ui_overlay(screen, font, title_font):
+
+def draw_flask(surface: pygame.Surface) -> None:
+    """Draw the container walls as glowing blue lines on surface."""
+    glow_color = (30,  70, 150)
+    wall_color = (100, 150, 220)
+    glow_width = 6
+    wall_width = 2
+
+    # Bottom, left wall, right wall — no top, so particles can fall in.
+    walls = [
+        ((F_LEFT,  F_BOT), (F_RIGHT, F_BOT)),
+        ((F_LEFT,  F_TOP), (F_LEFT,  F_BOT)),
+        ((F_RIGHT, F_TOP), (F_RIGHT, F_BOT)),
+    ]
+    for start, end in walls:
+        pygame.draw.line(surface, glow_color, start, end, glow_width)
+        pygame.draw.line(surface, wall_color, start, end, wall_width)
+
+
+def draw_obstacles(
+    surface:    pygame.Surface,
+    obs_xs:     np.ndarray,
+    obs_ys:     np.ndarray,
+    obs_ws:     np.ndarray,
+    obs_hs:     np.ndarray,
+    obs_active: np.ndarray,
+) -> None:
+    """Draw all active obstacle blocks as filled grey rectangles with an outline."""
+    for i in range(len(obs_active)):
+        if obs_active[i] == 1:
+            rect = pygame.Rect(
+                int(obs_xs[i]), int(obs_ys[i]),
+                int(obs_ws[i]), int(obs_hs[i]),
+            )
+            pygame.draw.rect(surface, (150, 150, 150), rect)
+            pygame.draw.rect(surface, (200, 200, 200), rect, 2)
+
+
+def draw_help_overlay(
+    screen:     pygame.Surface,
+    font:       pygame.font.Font,
+    title_font: pygame.font.Font,
+) -> None:
+    """Render a semi-transparent controls help screen over the simulation."""
     overlay = pygame.Surface((SIM_WIDTH, HEIGHT), pygame.SRCALPHA)
     overlay.fill((0, 0, 0, 180))
+
     title = title_font.render("SPH FLUID PLAYGROUND", True, (255, 255, 255))
     overlay.blit(title, (SIM_WIDTH // 2 - title.get_width() // 2, 80))
-    instructions = [
+
+    controls = [
         "--- Controls ---",
-        "[LMB Click + Hold]  Drag a Block OR Push the water",
+        "[LMB Click + Hold]  Drag a block  OR  push the water",
         "         (Use the UI panel on the right!)",
-        "[ C ]  Spawn a new Block at your mouse cursor",
-        "[ X ]  Delete the Block under your mouse cursor",
-        "[ M ]  Toggle Metaball rendering (Solid vs Particles)",
-        "[SPACE]  Pause / Resume pouring water",
-        "[ R ]  Reset Simulation",
-        "[ H ]  Hide or Show this Help menu",
+        "[ C ]  Spawn a new block at your cursor",
+        "[ X ]  Delete the block under your cursor",
+        "[ M ]  Toggle metaball rendering",
+        "[SPACE]  Pause / resume pouring",
+        "[ R ]  Reset simulation",
+        "[ H ]  Toggle this help screen",
         "",
-        "Press [H] to close this menu and play!",
+        "Press [H] to close and play!",
     ]
-    for i, line in enumerate(instructions):
+    for i, line in enumerate(controls):
         color = (255, 215, 0) if "Press [H]" in line else (200, 220, 255)
         text  = font.render(line, True, color)
         overlay.blit(text, (SIM_WIDTH // 2 - text.get_width() // 2, 160 + i * 25))
+
     screen.blit(overlay, (0, 0))
 
-def draw_flask(surf):
-    glow = (30,  70, 150)
-    wall = (100, 150, 220)
-    tg, tw = 6, 2
-    pygame.draw.line(surf, glow, (F_LEFT,  F_BOT), (F_RIGHT, F_BOT), tg)
-    pygame.draw.line(surf, wall, (F_LEFT,  F_BOT), (F_RIGHT, F_BOT), tw)
-    pygame.draw.line(surf, glow, (F_LEFT,  F_TOP), (F_LEFT,  F_BOT), tg)
-    pygame.draw.line(surf, wall, (F_LEFT,  F_TOP), (F_LEFT,  F_BOT), tw)
-    pygame.draw.line(surf, glow, (F_RIGHT, F_TOP), (F_RIGHT, F_BOT), tg)
-    pygame.draw.line(surf, wall, (F_RIGHT, F_TOP), (F_RIGHT, F_BOT), tw)
-
-def draw_obstacles(surf, obs_xs, obs_ys, obs_ws, obs_hs, obs_active):
-    for i in range(len(obs_active)):
-        if obs_active[i] == 1:
-            rect = pygame.Rect(int(obs_xs[i]), int(obs_ys[i]),
-                               int(obs_ws[i]), int(obs_hs[i]))
-            pygame.draw.rect(surf, (150, 150, 150), rect)
-            pygame.draw.rect(surf, (200, 200, 200), rect, 2)
 
 # ---------------------------------------------------------------------------
-# Main
+# Main — initialisation helpers
 # ---------------------------------------------------------------------------
-def main():
-    pygame.init()
-    screen = pygame.display.set_mode((WIDTH, HEIGHT))
-    pygame.display.set_caption("SPH Fluid — Phase 14: Dynamic Memory & FPS Graph")
-    clock      = pygame.time.Clock()
-    font       = pygame.font.SysFont("monospace", 14, bold=True)
-    title_font = pygame.font.SysFont("monospace", 28, bold=True)
-    small_font = pygame.font.SysFont("monospace", 12)
 
-    # ------------------------------------------------------------------
-    # Particle arrays — start at INITIAL_CAPACITY, grow as needed
-    # ------------------------------------------------------------------
-    current_capacity = INITIAL_CAPACITY
-    (xs, ys, vxs, vys, axs, ays,
-     densities, grid_next) = make_particle_arrays(current_capacity)
+def _init_sim_state() -> SimState:
+    """Allocate particle arrays and create the initial SimState.
 
+    One default obstacle block is placed near the flask floor so the user
+    has something to interact with immediately.
+
+    Returns:
+        A freshly initialised SimState ready for the main loop.
+    """
+    capacity = INITIAL_CAPACITY
+    xs, ys, vxs, vys, axs, ays, densities, grid_next = make_particle_arrays(capacity)
     grid_head = np.full((MAX_GRID_COLS, MAX_GRID_ROWS), -1, dtype=np.int32)
 
-    num_active    = 0
-    pouring       = True
-    use_metaballs = False
-    show_help     = True
+    state = SimState(
+        capacity   = capacity,
+        num_active = 0,
+        xs = xs, ys = ys,
+        vxs = vxs, vys = vys,
+        axs = axs, ays = ays,
+        densities = densities,
+        grid_next = grid_next,
+        grid_head = grid_head,
+    )
 
-    # ------------------------------------------------------------------
-    # Rest-density cache  (pre-flight fix: no longer computed every frame)
-    # ------------------------------------------------------------------
-    last_radius  = -1.0
-    rest_density = 1.0
+    # Default obstacle: a square block centred at the flask floor.
+    state.obs_ws[0]    = 80.0
+    state.obs_hs[0]    = 80.0
+    state.obs_xs[0]    = SIM_WIDTH / 2.0 - 40.0
+    state.obs_ys[0]    = HEIGHT - 130.0
+    state.obs_active[0] = 1
 
-    # ------------------------------------------------------------------
-    # FPS history ring buffer  (Phase 14)
-    # ------------------------------------------------------------------
-    fps_history = deque(maxlen=FPS_HISTORY_LEN)
+    return state
 
-    # ------------------------------------------------------------------
-    # UI Widgets
-    # ------------------------------------------------------------------
-    btn_basic = Button(SIM_WIDTH + 20,  20, 100, 30, "Basic")
-    btn_adv   = Button(SIM_WIDTH + 130, 20, 100, 30, "Advanced")
+
+def _build_ui() -> dict:
+    """Create and return all UI widgets as a plain dict.
+
+    Default slider values are defined here — this is the one place to look
+    if you want to change what value a slider starts at.
+
+    Returns:
+        A dict with keys: btn_basic, btn_adv, basic_sliders, adv_sliders.
+        basic_sliders and adv_sliders are lists of Slider objects.
+    """
+    panel_x = SIM_WIDTH + 20  # Left edge of the control panel.
+
+    btn_basic        = Button(panel_x,        20, 100, 30, "Basic")
+    btn_adv          = Button(panel_x + 110,  20, 100, 30, "Advanced")
     btn_basic.active = True
 
-    # Basic tab — slider_count ceiling is now SLIDER_MAX, not the array size
-    slider_size  = Slider(SIM_WIDTH + 20, 100, 210, 15,
-                          1.0, 6.0, 2.0, "Particle Size")
-    slider_count = Slider(SIM_WIDTH + 20, 170, 210, 15,
-                          100, SLIDER_MAX, 6000, "Max Particles", is_int=True)
+    # Basic tab — Particle Size auto-scales smoothing radius, mass, and rest
+    # density, keeping the simulation numerically stable at any size.
+    slider_size  = Slider(panel_x, 100, 210, 15,
+                          min_val=1.0, max_val=6.0, initial_val=2.0,
+                          text="Particle Size")
+    slider_count = Slider(panel_x, 170, 210, 15,
+                          min_val=100, max_val=SLIDER_MAX, initial_val=6000,
+                          text="Max Particles", is_int=True)
     basic_sliders = [slider_size, slider_count]
 
-    # Advanced tab
-    slider_gravity = Slider(SIM_WIDTH + 20, 100, 210, 15, -1.0, 1.0,  0.35, "Gravity",      decimals=2)
-    slider_stiff   = Slider(SIM_WIDTH + 20, 170, 210, 15,  0.1, 5.0,  1.0,  "Stiffness",    decimals=1)
-    slider_visc    = Slider(SIM_WIDTH + 20, 240, 210, 15,  0.0, 0.2,  0.05, "Viscosity",    decimals=3)
-    slider_surf    = Slider(SIM_WIDTH + 20, 310, 210, 15,  0.0, 0.1,  0.02, "Surf Tension", decimals=3)
-    slider_rest    = Slider(SIM_WIDTH + 20, 380, 210, 15,  0.0, 1.0,  0.3,  "Restitution",  decimals=2)
-    adv_sliders    = [slider_gravity, slider_stiff, slider_visc, slider_surf, slider_rest]
+    # Advanced tab — these pass directly into the Numba kernels with no
+    # scaling. Extreme values can make the simulation unstable; use with care.
+    slider_gravity = Slider(panel_x, 100, 210, 15,
+                            min_val=-1.0, max_val=1.0,
+                            initial_val=DEFAULT_GRAVITY,
+                            text="Gravity", decimals=2)
+    slider_stiff   = Slider(panel_x, 170, 210, 15,
+                            min_val=0.1, max_val=5.0,
+                            initial_val=DEFAULT_STIFFNESS,
+                            text="Stiffness", decimals=1)
+    slider_visc    = Slider(panel_x, 240, 210, 15,
+                            min_val=0.0, max_val=0.5,
+                            initial_val=DEFAULT_VISCOSITY,
+                            text="Viscosity", decimals=3)
+    slider_surf    = Slider(panel_x, 310, 210, 15,
+                            min_val=0.0, max_val=1.0,
+                            initial_val=DEFAULT_SURF_TENSION,
+                            text="Surf Tension", decimals=3)
+    slider_rest    = Slider(panel_x, 380, 210, 15,
+                            min_val=0.0, max_val=1.0,
+                            initial_val=DEFAULT_RESTITUTION,
+                            text="Restitution", decimals=2)
+    adv_sliders = [slider_gravity, slider_stiff, slider_visc, slider_surf, slider_rest]
 
-    # ------------------------------------------------------------------
-    # Obstacles
-    # ------------------------------------------------------------------
-    MAX_OBS    = 10
-    obs_xs     = np.zeros(MAX_OBS, dtype=np.float32)
-    obs_ys     = np.zeros(MAX_OBS, dtype=np.float32)
-    obs_ws     = np.zeros(MAX_OBS, dtype=np.float32)
-    obs_hs     = np.zeros(MAX_OBS, dtype=np.float32)
-    obs_active = np.zeros(MAX_OBS, dtype=np.int32)
+    return {
+        "btn_basic":     btn_basic,
+        "btn_adv":       btn_adv,
+        "basic_sliders": basic_sliders,
+        "adv_sliders":   adv_sliders,
+    }
 
-    obs_ws[0], obs_hs[0] = 80.0, 80.0
-    obs_xs[0]  = SIM_WIDTH // 2 - 40.0
-    obs_ys[0]  = HEIGHT - 130.0
-    obs_active[0] = 1
 
-    dragging_idx            = -1
-    pushing_water           = False
-    drag_offset_x           = 0.0
-    drag_offset_y           = 0.0
+# ---------------------------------------------------------------------------
+# Main — per-frame helpers
+# ---------------------------------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # Main loop
-    # ------------------------------------------------------------------
-    running = True
-    while running:
-        ui_interacted  = False
-        active_sliders = basic_sliders if btn_basic.active else adv_sliders
+def _handle_events(state: SimState, ui: dict) -> bool:
+    """Process the Pygame event queue for one frame.
 
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
+    Handles keyboard shortcuts, mouse presses, slider drags, tab switches,
+    and the quit event. All simulation state mutations from user input happen
+    here.
 
-            for s in active_sliders:
-                if s.handle_event(event):
-                    ui_interacted = True
+    Args:
+        state: Current simulation state (mutated in place).
+        ui:    Dict of UI widgets (mutated in place).
 
-            if btn_basic.handle_event(event):
-                btn_basic.active = True;  btn_adv.active = False;  ui_interacted = True
-            if btn_adv.handle_event(event):
-                btn_adv.active   = True;  btn_basic.active = False; ui_interacted = True
+    Returns:
+        False if the user closed the window, True otherwise.
+    """
+    btn_basic      = ui["btn_basic"]
+    btn_adv        = ui["btn_adv"]
+    active_sliders = ui["basic_sliders"] if btn_basic.active else ui["adv_sliders"]
 
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_h:
-                    show_help = not show_help
-                elif event.key == pygame.K_r:
-                    num_active = 0
-                    pouring    = True
-                elif event.key == pygame.K_SPACE:
-                    pouring = not pouring
-                elif event.key == pygame.K_m:
-                    use_metaballs = not use_metaballs
-                elif event.key == pygame.K_c:
-                    mx, my = pygame.mouse.get_pos()
-                    if mx < SIM_WIDTH:
-                        for i in range(MAX_OBS):
-                            if obs_active[i] == 0:
-                                obs_ws[i], obs_hs[i] = 60.0, 60.0
-                                obs_xs[i] = float(mx - 30.0)
-                                obs_ys[i] = float(my - 30.0)
-                                obs_active[i] = 1
-                                break
-                elif event.key == pygame.K_x:
-                    mx, my = pygame.mouse.get_pos()
-                    for i in range(MAX_OBS):
-                        if obs_active[i] == 1:
-                            if (obs_xs[i] <= mx <= obs_xs[i] + obs_ws[i]
-                                    and obs_ys[i] <= my <= obs_ys[i] + obs_hs[i]):
-                                obs_active[i] = 0
-                                break
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            return False
 
-            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and not ui_interacted:
-                mx, my = pygame.mouse.get_pos()
-                if mx < SIM_WIDTH:
-                    clicked_block = False
-                    for i in range(MAX_OBS):
-                        if obs_active[i] == 1:
-                            if (obs_xs[i] <= mx <= obs_xs[i] + obs_ws[i]
-                                    and obs_ys[i] <= my <= obs_ys[i] + obs_hs[i]):
-                                dragging_idx  = i
-                                drag_offset_x = mx - obs_xs[i]
-                                drag_offset_y = my - obs_ys[i]
-                                clicked_block = True
-                                break
-                    if not clicked_block:
-                        pushing_water = True
+        # Sliders and tab buttons are checked first so a click on the panel
+        # does not also trigger a fluid push in the simulation viewport.
+        ui_consumed = False
+        for slider in active_sliders:
+            if slider.handle_event(event):
+                ui_consumed = True
 
-            if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-                dragging_idx  = -1
-                pushing_water = False
+        if btn_basic.handle_event(event):
+            btn_basic.active = True
+            btn_adv.active   = False
+            ui_consumed      = True
+        if btn_adv.handle_event(event):
+            btn_adv.active   = True
+            btn_basic.active = False
+            ui_consumed      = True
 
-        # ------------------------------------------------------------------
-        # Read slider values
-        # ------------------------------------------------------------------
-        particle_radius      = slider_size.val
-        current_max_particles = int(slider_count.val)
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_h:
+                state.show_help = not state.show_help
+            elif event.key == pygame.K_r:
+                state.num_active = 0
+                state.pouring    = True
+            elif event.key == pygame.K_SPACE:
+                state.pouring = not state.pouring
+            elif event.key == pygame.K_m:
+                state.use_metaballs = not state.use_metaballs
+            elif event.key == pygame.K_c:
+                _spawn_obstacle(state)
+            elif event.key == pygame.K_x:
+                _delete_obstacle_under_cursor(state)
 
-        gravity_val      = slider_gravity.val
-        stiffness_val    = slider_stiff.val
-        viscosity_val    = slider_visc.val
-        surf_tension_val = slider_surf.val
-        restitution_val  = slider_rest.val
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and not ui_consumed:
+            _on_sim_click(state)
 
-        # Slider dragged down: silently discard particles above the new limit.
-        # NOTE: this is intentionally lossy — dragging back up does NOT restore
-        # them. The data beyond num_active is stale and must not be trusted.
-        if num_active > current_max_particles:
-            num_active = current_max_particles
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            state.dragging_idx  = -1
+            state.pushing_water = False
 
-        smoothing_radius = particle_radius * 5.0
-        mass             = particle_radius ** 2
-        render_radius    = particle_radius * 2.0
+    return True
 
-        # Recompute rest density only when the size slider actually changes.
-        if particle_radius != last_radius:
-            rest_density = calibrate_rest_density(smoothing_radius, particle_radius, mass)
-            last_radius  = particle_radius
 
-        grid_cols = math.ceil(SIM_WIDTH / smoothing_radius) + 2
-        grid_rows = math.ceil(HEIGHT    / smoothing_radius) + 2
+def _spawn_obstacle(state: SimState) -> None:
+    """Spawn a 60x60 obstacle block centred on the current cursor position.
 
-        # ------------------------------------------------------------------
-        # Dynamic resize  (Phase 14) — grow before the pour loop so we never
-        # index beyond the allocated length.
-        # ------------------------------------------------------------------
-        (current_capacity,
-         xs, ys, vxs, vys, axs, ays,
-         densities, grid_next) = maybe_grow_arrays(
-            num_active, current_capacity,
-            xs, ys, vxs, vys, axs, ays, densities, grid_next,
-        )
+    Does nothing if all obstacle slots are already occupied or the cursor
+    is over the UI panel.
+    """
+    mx, my = pygame.mouse.get_pos()
+    if mx >= SIM_WIDTH:
+        return  # Cursor is over the UI panel.
+    for i in range(len(state.obs_active)):
+        if state.obs_active[i] == 0:
+            state.obs_ws[i]    = 60.0
+            state.obs_hs[i]    = 60.0
+            state.obs_xs[i]    = float(mx - 30)
+            state.obs_ys[i]    = float(my - 30)
+            state.obs_active[i] = 1
+            return  # Only spawn one block per keypress.
 
-        # ------------------------------------------------------------------
-        mx, my = pygame.mouse.get_pos()
 
-        if dragging_idx != -1:
-            obs_xs[dragging_idx] = float(mx - drag_offset_x)
-            obs_ys[dragging_idx] = float(my - drag_offset_y)
-
-        if pouring and num_active < current_max_particles and not show_help:
-            for _ in range(POUR_RATE):
-                if num_active >= current_max_particles:
-                    break
-                xs[num_active]        = POUR_X + random.uniform(-POUR_SPREAD, POUR_SPREAD)
-                ys[num_active]        = POUR_Y + random.uniform(-POUR_SPREAD, POUR_SPREAD)
-                vxs[num_active]       = POUR_VX + random.uniform(-0.3, 0.3)
-                vys[num_active]       = POUR_VY + random.uniform(-0.2, 0.2)
-                axs[num_active]       = 0.0
-                # ays intentionally NOT set here — integrate() resets it anyway.
-                densities[num_active] = rest_density
-                num_active           += 1
-
-        if pushing_water and num_active > 0 and not show_help:
-            apply_mouse_push(xs, ys, vxs, vys, num_active,
-                             mx, my, MOUSE_RADIUS, MOUSE_STRENGTH)
-
-        # ------------------------------------------------------------------
-        # Physics passes
-        # ------------------------------------------------------------------
-        if num_active > 0 and not show_help:
-            build_grid(xs, ys, num_active, smoothing_radius,
-                       grid_cols, grid_rows, grid_head, grid_next)
-            compute_densities(xs, ys, densities, num_active, smoothing_radius, mass,
-                              grid_cols, grid_rows, grid_head, grid_next)
-            apply_pressure(xs, ys, axs, ays, densities, num_active, smoothing_radius, mass,
-                           stiffness_val, rest_density,
-                           grid_cols, grid_rows, grid_head, grid_next)
-            apply_viscosity(xs, ys, vxs, vys, densities, num_active, smoothing_radius, mass,
-                            viscosity_val, grid_cols, grid_rows, grid_head, grid_next)
-            apply_surface_tension(xs, ys, axs, ays, densities, num_active, smoothing_radius, mass,
-                                  surf_tension_val, rest_density * INTERIOR_DENSITY_RATIO,
-                                  grid_cols, grid_rows, grid_head, grid_next)
-            integrate(xs, ys, vxs, vys, axs, ays, num_active, gravity_val)
-
-            resolve_obstacles(xs, ys, vxs, vys, num_active, particle_radius,
-                              obs_xs, obs_ys, obs_ws, obs_hs, obs_active,
-                              restitution_val, WALL_FRICTION)
-            resolve_overlaps(xs, ys, num_active, smoothing_radius, particle_radius * 2.0,
-                             grid_cols, grid_rows, grid_head, grid_next)
-            resolve_obstacles(xs, ys, vxs, vys, num_active, particle_radius,
-                              obs_xs, obs_ys, obs_ws, obs_hs, obs_active,
-                              restitution_val, WALL_FRICTION)
-            resolve_flask(xs, ys, vxs, vys, num_active, particle_radius,
-                          WALL_FRICTION, restitution_val,
-                          F_LEFT, F_RIGHT, F_TOP, F_BOT)
-
-        # ------------------------------------------------------------------
-        # Render — simulation area
-        # ------------------------------------------------------------------
-        screen.fill(BACKGROUND)
-
-        if use_metaballs and num_active > 0:
-            lw     = SIM_WIDTH // RENDER_SCALE
-            lh     = HEIGHT    // RENDER_SCALE
-            pixels = compute_metaballs(
-                xs, ys, vxs, vys, num_active, lw, lh, RENDER_SCALE,
-                render_radius, RENDER_THRESHOLD,
-                F_LEFT, F_RIGHT, F_BOT,
-                obs_xs, obs_ys, obs_ws, obs_hs, obs_active,
+def _delete_obstacle_under_cursor(state: SimState) -> None:
+    """Remove the first obstacle block whose bounding box contains the cursor."""
+    mx, my = pygame.mouse.get_pos()
+    for i in range(len(state.obs_active)):
+        if state.obs_active[i] == 1:
+            hit = (
+                state.obs_xs[i] <= mx <= state.obs_xs[i] + state.obs_ws[i]
+                and state.obs_ys[i] <= my <= state.obs_ys[i] + state.obs_hs[i]
             )
-            surf = pygame.surfarray.make_surface(pixels)
-            surf = pygame.transform.smoothscale(surf, (SIM_WIDTH, HEIGHT))
-            screen.blit(surf, (0, 0))
-        else:
-            for i in range(num_active):
-                spd   = math.hypot(vxs[i], vys[i])
-                color = speed_to_color(spd)
-                pygame.draw.circle(screen, color,
-                                   (int(xs[i]), int(ys[i])), int(particle_radius))
+            if hit:
+                state.obs_active[i] = 0
+                return
 
-        draw_flask(screen)
-        draw_obstacles(screen, obs_xs, obs_ys, obs_ws, obs_hs, obs_active)
 
-        if pushing_water and not show_help:
-            pygame.draw.circle(screen, (255, 255, 255, 100),
-                               (mx, my), int(MOUSE_RADIUS), 1)
+def _on_sim_click(state: SimState) -> None:
+    """Handle a left-click in the simulation viewport.
 
-        hud = small_font.render(
-            f"FPS: {clock.get_fps():.0f}  |  "
-            f"{num_active}/{current_max_particles} particles  "
-            f"(cap {current_capacity})  |  [H] Help",
-            True, (150, 180, 220),
+    If the click lands on an obstacle, starts dragging it. Otherwise,
+    starts pushing the fluid.
+    """
+    mx, my = pygame.mouse.get_pos()
+    if mx >= SIM_WIDTH:
+        return  # Click was in the UI panel.
+
+    for i in range(len(state.obs_active)):
+        if state.obs_active[i] == 1:
+            hit = (
+                state.obs_xs[i] <= mx <= state.obs_xs[i] + state.obs_ws[i]
+                and state.obs_ys[i] <= my <= state.obs_ys[i] + state.obs_hs[i]
+            )
+            if hit:
+                state.dragging_idx  = i
+                state.drag_offset_x = mx - state.obs_xs[i]
+                state.drag_offset_y = my - state.obs_ys[i]
+                return  # Obstacle drag takes priority over fluid push.
+
+    state.pushing_water = True
+
+
+def _step_physics(state: SimState, ui: dict) -> None:
+    """Run one complete physics tick: pour -> forces -> integrate -> resolve.
+
+    Physics pass order:
+        1. build_grid            hash particles into spatial grid
+        2. compute_densities     estimate rho_i for each particle
+        3. apply_pressure        pressure repulsion forces
+        4. apply_viscosity       velocity smoothing
+        5. apply_surface_tension surface cohesion
+        6. integrate             advance positions and velocities
+        7. resolve_obstacles     push out of boxes (pass 1)
+        8. resolve_overlaps      push apart overlapping particles
+        9. resolve_obstacles     push out of boxes (pass 2 catches re-entries)
+        10. resolve_flask        clamp inside container
+
+    The double obstacle-resolution pass (7+9) prevents particles from
+    tunnelling through obstacle sides at high speeds.
+
+    Args:
+        state: Simulation state (mutated in place).
+        ui:    UI widget dict (slider values are read each frame).
+    """
+    # Read slider values — updates take effect the very next frame.
+    basic_s = ui["basic_sliders"]
+    adv_s   = ui["adv_sliders"]
+
+    particle_radius = basic_s[0].val        # Slider: Particle Size
+    current_max     = int(basic_s[1].val)   # Slider: Max Particles
+
+    gravity      = adv_s[0].val  # Slider: Gravity
+    stiffness    = adv_s[1].val  # Slider: Stiffness
+    viscosity    = adv_s[2].val  # Slider: Viscosity
+    surf_tension = adv_s[3].val  # Slider: Surf Tension
+    restitution  = adv_s[4].val  # Slider: Restitution
+
+    # Silently drop particles if the cap was dragged down.
+    # Intentionally lossy: particles are NOT restored when dragged back up.
+    if state.num_active > current_max:
+        state.num_active = current_max
+
+    # Derived physics values — all scale with particle size for stability.
+    smoothing_h    = particle_radius * 5.0
+    mass           = particle_radius ** 2
+    particle_diam  = particle_radius * 2.0
+    cutoff_density = state.rest_density * SURFACE_CUTOFF_RATIO
+
+    # Re-calibrate rest density only when particle size has changed.
+    if particle_radius != state.last_particle_radius:
+        state.rest_density         = calibrate_rest_density(smoothing_h, particle_radius, mass)
+        state.last_particle_radius = particle_radius
+
+    grid_cols = math.ceil(SIM_WIDTH / smoothing_h) + 2
+    grid_rows = math.ceil(HEIGHT    / smoothing_h) + 2
+
+    # Grow arrays before pouring so the pour loop never overflows.
+    maybe_grow_arrays(state)
+
+    # Move the dragged obstacle to follow the cursor.
+    mx, my = pygame.mouse.get_pos()
+    if state.dragging_idx >= 0:
+        state.obs_xs[state.dragging_idx] = float(mx - state.drag_offset_x)
+        state.obs_ys[state.dragging_idx] = float(my - state.drag_offset_y)
+
+    # Pour new particles while the help overlay is hidden.
+    if state.pouring and state.num_active < current_max and not state.show_help:
+        for _ in range(POUR_RATE):
+            if state.num_active >= current_max:
+                break
+            n = state.num_active
+            state.xs[n]  = POUR_X + random.uniform(-POUR_SPREAD, POUR_SPREAD)
+            state.ys[n]  = POUR_Y + random.uniform(-POUR_SPREAD, POUR_SPREAD)
+            state.vxs[n] = POUR_VX + random.uniform(-0.3, 0.3)
+            state.vys[n] = POUR_VY + random.uniform(-0.2, 0.2)
+            state.axs[n] = 0.0
+            # ays[n] is NOT set — integrate() loads gravity into ays every frame.
+            state.densities[n] = state.rest_density
+            state.num_active  += 1
+
+    # Apply cursor push while LMB is held and help is hidden.
+    if state.pushing_water and state.num_active > 0 and not state.show_help:
+        apply_mouse_push(
+            state.xs, state.ys, state.vxs, state.vys, state.num_active,
+            float(mx), float(my),
+            MOUSE_PUSH_RADIUS, MOUSE_PUSH_STRENGTH,
         )
-        screen.blit(hud, (10, 10))
 
-        if show_help:
-            draw_ui_overlay(screen, font, title_font)
-
-        # ------------------------------------------------------------------
-        # Render — UI panel (right side)
-        # ------------------------------------------------------------------
-        pygame.draw.rect(screen, (22, 28, 40), (SIM_WIDTH, 0, UI_WIDTH, HEIGHT))
-        pygame.draw.line(screen, (50, 60, 80), (SIM_WIDTH, 0), (SIM_WIDTH, HEIGHT), 2)
-
-        btn_basic.draw(screen, font)
-        btn_adv.draw(screen, font)
-
-        for s in active_sliders:
-            s.draw(screen, font)
-
-        hint_text = "Auto-Scaling ensures stability." if btn_basic.active else "Raw physics variables."
-        info = small_font.render(hint_text, True, (100, 150, 200))
-        screen.blit(info, (SIM_WIDTH + 15, HEIGHT - 110))
-
-        # FPS graph — sits at the very bottom of the panel
-        fps_history.append(clock.get_fps())
-        draw_fps_graph(
-            screen, small_font, fps_history,
-            panel_x = SIM_WIDTH + 10,
-            panel_y = HEIGHT - 95,
-            panel_w = UI_WIDTH - 20,
-            panel_h = 88,
+    # Run the full physics pipeline (skipped while the help overlay is shown).
+    if state.num_active > 0 and not state.show_help:
+        build_grid(
+            state.xs, state.ys, state.num_active, smoothing_h,
+            grid_cols, grid_rows, state.grid_head, state.grid_next,
+        )
+        compute_densities(
+            state.xs, state.ys, state.densities, state.num_active,
+            smoothing_h, mass, grid_cols, grid_rows,
+            state.grid_head, state.grid_next,
+        )
+        apply_pressure(
+            state.xs, state.ys, state.axs, state.ays,
+            state.densities, state.num_active,
+            smoothing_h, mass, stiffness, state.rest_density,
+            grid_cols, grid_rows, state.grid_head, state.grid_next,
+        )
+        apply_viscosity(
+            state.xs, state.ys, state.vxs, state.vys,
+            state.densities, state.num_active,
+            smoothing_h, mass, viscosity,
+            grid_cols, grid_rows, state.grid_head, state.grid_next,
+        )
+        apply_surface_tension(
+            state.xs, state.ys, state.axs, state.ays,
+            state.densities, state.num_active,
+            smoothing_h, mass, surf_tension, cutoff_density,
+            grid_cols, grid_rows, state.grid_head, state.grid_next,
+        )
+        integrate(
+            state.xs, state.ys, state.vxs, state.vys,
+            state.axs, state.ays, state.num_active, gravity,
+        )
+        resolve_obstacles(
+            state.xs, state.ys, state.vxs, state.vys, state.num_active,
+            particle_radius,
+            state.obs_xs, state.obs_ys, state.obs_ws, state.obs_hs, state.obs_active,
+            restitution, WALL_FRICTION,
+        )
+        resolve_overlaps(
+            state.xs, state.ys, state.num_active,
+            smoothing_h, particle_diam,
+            grid_cols, grid_rows, state.grid_head, state.grid_next,
+        )
+        resolve_obstacles(
+            state.xs, state.ys, state.vxs, state.vys, state.num_active,
+            particle_radius,
+            state.obs_xs, state.obs_ys, state.obs_ws, state.obs_hs, state.obs_active,
+            restitution, WALL_FRICTION,
+        )
+        resolve_flask(
+            state.xs, state.ys, state.vxs, state.vys, state.num_active,
+            particle_radius, WALL_FRICTION, restitution,
+            F_LEFT, F_RIGHT, F_TOP, F_BOT,
         )
 
+    # Cache values the renderer needs this frame.
+    state._particle_radius = particle_radius
+    state._render_radius   = particle_radius * 2.0
+    state._current_max     = current_max
+
+
+def _render_frame(
+    screen: pygame.Surface,
+    state:  SimState,
+    ui:     dict,
+    fonts:  dict,
+    clock:  pygame.time.Clock,
+) -> None:
+    """Draw the complete frame: simulation viewport, HUD, and UI panel.
+
+    Args:
+        screen: Destination display surface.
+        state:  Current simulation state.
+        ui:     Dict of UI widgets.
+        fonts:  Dict with keys 'normal', 'title', 'small'.
+        clock:  Pygame clock (used for FPS readout and graph).
+    """
+    font       = fonts["normal"]
+    title_font = fonts["title"]
+    small_font = fonts["small"]
+
+    # --- Simulation viewport ---
+    screen.fill(BACKGROUND_COLOR)
+
+    if state.use_metaballs and state.num_active > 0:
+        grid_w     = SIM_WIDTH // METABALL_SCALE
+        grid_h     = HEIGHT    // METABALL_SCALE
+        pixels     = compute_metaballs(
+            state.xs, state.ys, state.vxs, state.vys,
+            state.num_active, grid_w, grid_h, METABALL_SCALE,
+            state._render_radius, METABALL_THRESHOLD,
+            F_LEFT, F_RIGHT, F_BOT,
+            state.obs_xs, state.obs_ys, state.obs_ws, state.obs_hs, state.obs_active,
+        )
+        fluid_surf = pygame.surfarray.make_surface(pixels)
+        fluid_surf = pygame.transform.smoothscale(fluid_surf, (SIM_WIDTH, HEIGHT))
+        screen.blit(fluid_surf, (0, 0))
+    else:
+        for i in range(state.num_active):
+            spd   = math.hypot(state.vxs[i], state.vys[i])
+            color = speed_to_heatmap_color(spd)
+            pygame.draw.circle(
+                screen, color,
+                (int(state.xs[i]), int(state.ys[i])),
+                int(state._particle_radius),
+            )
+
+    draw_flask(screen)
+    draw_obstacles(
+        screen,
+        state.obs_xs, state.obs_ys,
+        state.obs_ws, state.obs_hs,
+        state.obs_active,
+    )
+
+    # Show the cursor influence circle while pushing.
+    if state.pushing_water and not state.show_help:
+        mx, my = pygame.mouse.get_pos()
+        pygame.draw.circle(screen, (255, 255, 255, 100), (mx, my), int(MOUSE_PUSH_RADIUS), 1)
+
+    # HUD: FPS and particle count, top-left corner.
+    hud = (
+        f"FPS: {clock.get_fps():.0f}  |  "
+        f"{state.num_active}/{state._current_max} particles  |  [H] Help"
+    )
+    screen.blit(small_font.render(hud, True, (150, 180, 220)), (10, 10))
+
+    if state.show_help:
+        draw_help_overlay(screen, font, title_font)
+
+    # --- Control panel ---
+    pygame.draw.rect(screen, (22, 28, 40), (SIM_WIDTH, 0, UI_WIDTH, HEIGHT))
+    pygame.draw.line(screen, (50, 60, 80), (SIM_WIDTH, 0), (SIM_WIDTH, HEIGHT), 2)
+
+    btn_basic = ui["btn_basic"]
+    btn_adv   = ui["btn_adv"]
+    btn_basic.draw(screen, font)
+    btn_adv.draw(screen, font)
+
+    active_sliders = ui["basic_sliders"] if btn_basic.active else ui["adv_sliders"]
+    for slider in active_sliders:
+        slider.draw(screen, font)
+
+    hint = "Auto-Scaling ensures stability." if btn_basic.active else "Raw physics variables."
+    screen.blit(small_font.render(hint, True, (100, 150, 200)), (SIM_WIDTH + 15, HEIGHT - 110))
+
+    # FPS performance graph at the bottom of the control panel.
+    state.fps_history.append(clock.get_fps())
+    draw_fps_graph(
+        screen, small_font, state.fps_history,
+        panel_x = SIM_WIDTH + 10,
+        panel_y = HEIGHT - 95,
+        panel_w = UI_WIDTH - 20,
+        panel_h = 88,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    """Initialise Pygame, build the simulation, and run the main loop.
+
+    Loop structure each frame:
+        _handle_events  -> _step_physics  -> _render_frame  -> flip -> tick
+
+    Numba JIT compilation happens on the first physics step, causing a brief
+    pause (2-4 seconds) before the first particles appear. This is expected.
+    """
+    pygame.init()
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    pygame.display.set_caption("SPH Fluid Simulation")
+    clock  = pygame.time.Clock()
+
+    fonts = {
+        "normal": pygame.font.SysFont("monospace", 14, bold=True),
+        "title":  pygame.font.SysFont("monospace", 28, bold=True),
+        "small":  pygame.font.SysFont("monospace", 12),
+    }
+
+    state   = _init_sim_state()
+    ui      = _build_ui()
+    running = True
+
+    while running:
+        running = _handle_events(state, ui)
+        _step_physics(state, ui)
+        _render_frame(screen, state, ui, fonts, clock)
         pygame.display.flip()
-        clock.tick(FPS)
+        clock.tick(TARGET_FPS)
 
     pygame.quit()
 
