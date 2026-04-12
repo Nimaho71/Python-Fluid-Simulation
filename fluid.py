@@ -358,15 +358,18 @@ class Slider:
 
     Supports both continuous float values and integer (snapped) values.
     The label and current value are rendered directly above the track.
+    Clicking the slider focuses it, allowing keyboard entry.
 
     Attributes:
-        rect:     Bounding rectangle of the slider track.
-        min_val:  Minimum selectable value.
-        max_val:  Maximum selectable value.
-        val:      Current value.
-        text:     Label shown above the slider.
-        is_int:   If True, the value is rounded to the nearest integer.
-        decimals: Decimal places shown when is_int is False.
+        rect:       Bounding rectangle of the slider track.
+        min_val:    Minimum selectable value.
+        max_val:    Maximum selectable value.
+        val:        Current value.
+        text:       Label shown above the slider.
+        is_int:     If True, the value is rounded to the nearest integer.
+        decimals:   Decimal places shown when is_int is False.
+        focused:    True if the user is typing a custom value.
+        input_text: Temporary string holding the typed value.
     """
 
     def __init__(
@@ -377,30 +380,44 @@ class Slider:
         is_int: bool = False,
         decimals: int = 1,
     ) -> None:
-        self.rect     = pygame.Rect(x, y, w, h)
-        self.min_val  = min_val
-        self.max_val  = max_val
-        self.val      = initial_val
-        self.text     = text
-        self.is_int   = is_int
-        self.decimals = decimals
-        self.dragging = False
+        self.rect       = pygame.Rect(x, y, w, h)
+        self.min_val    = min_val
+        self.max_val    = max_val
+        self.val        = initial_val
+        self.text       = text
+        self.is_int     = is_int
+        self.decimals   = decimals
+        self.dragging   = False
+        self.focused    = False
+        self.input_text = ""
 
     def handle_event(self, event: pygame.event.Event) -> bool:
-        """Update the slider value from a mouse event.
+        """Update the slider value from a mouse event or keyboard input."""
+        
+        # Create a hitbox that covers both the track and the label text above it
+        hitbox = pygame.Rect(self.rect.x, self.rect.y - 25, self.rect.width, self.rect.height + 25)
 
-        Args:
-            event: A Pygame event.
-
-        Returns:
-            True if the event was consumed by this slider.
-        """
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            if self.rect.collidepoint(event.pos):
-                self.dragging = True
+            if hitbox.collidepoint(event.pos):
+                if not self.focused:
+                    self.focused = True
+                    self.input_text = ""
+                # If they clicked the physical track, allow dragging
+                if self.rect.collidepoint(event.pos):
+                    self.dragging = True
                 return True
+            else:
+                # Clicked elsewhere: apply the typed value and unfocus
+                if self.focused:
+                    self._apply_input()
+                    self.focused = False
+                return False
+
         elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-            self.dragging = False
+            if self.dragging:
+                self.dragging = False
+                return True
+
         elif event.type == pygame.MOUSEMOTION and self.dragging:
             relative_x = max(0, min(event.pos[0] - self.rect.x, self.rect.width))
             fraction   = relative_x / self.rect.width
@@ -408,27 +425,62 @@ class Slider:
             if self.is_int:
                 self.val = int(self.val)
             return True
+
+        elif event.type == pygame.KEYDOWN and self.focused:
+            if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                self._apply_input()
+                self.focused = False
+            elif event.key == pygame.K_ESCAPE:
+                self.focused = False # Cancels input, reverts to previous slider val
+            elif event.key == pygame.K_BACKSPACE:
+                self.input_text = self.input_text[:-1]
+            else:
+                # Accept digits, period, and minus sign
+                char = event.unicode
+                if char in "0123456789.-":
+                    self.input_text += char
+            return True
+
         return False
+
+    def _apply_input(self) -> None:
+        """Parse the typed input text, clamp it, and update the slider value."""
+        if not self.input_text:
+            return
+        try:
+            new_val = float(self.input_text)
+            if self.is_int:
+                new_val = int(new_val)
+            # Clamp the value between min_val and max_val safely!
+            self.val = max(self.min_val, min(new_val, self.max_val))
+        except ValueError:
+            pass  # Invalid text (e.g., "-", "."), just ignore it.
 
     def draw(self, screen: pygame.Surface, font: pygame.font.Font) -> None:
         """Render the slider track, handle, and label to screen."""
-        # Track background
         pygame.draw.rect(screen, (40, 50, 70), self.rect, border_radius=4)
 
-        # Handle: position maps val linearly onto the track width.
         t        = (self.val - self.min_val) / (self.max_val - self.min_val)
         handle_x = self.rect.x + int(t * self.rect.width)
+
+        handle_color = (255, 215, 0) if self.focused else (200, 220, 255)
         pygame.draw.circle(
-            screen, (200, 220, 255),
+            screen, handle_color,
             (handle_x, self.rect.centery),
             self.rect.height // 2 + 4,
         )
 
-        # Label and current value rendered above the track.
-        val_str = f"{int(self.val)}" if self.is_int else f"{self.val:.{self.decimals}f}"
-        label   = font.render(f"{self.text}: {val_str}", True, (220, 230, 255))
-        screen.blit(label, (self.rect.x, self.rect.y - 22))
+        if self.focused:
+            # Create a blinking cursor natively in Pygame using get_ticks()
+            cursor = "|" if (pygame.time.get_ticks() // 500) % 2 == 0 else ""
+            val_str = f"{self.input_text}{cursor}"
+            text_color = (255, 215, 0)
+        else:
+            val_str = f"{int(self.val)}" if self.is_int else f"{self.val:.{self.decimals}f}"
+            text_color = (220, 230, 255)
 
+        label = font.render(f"{self.text}: {val_str}", True, text_color)
+        screen.blit(label, (self.rect.x, self.rect.y - 22))
 
 # ---------------------------------------------------------------------------
 # UI: Button
@@ -1304,7 +1356,7 @@ def _build_ui() -> dict:
                           min_val=1.0, max_val=6.0, initial_val=2.0,
                           text="Particle Size")
     slider_count = Slider(panel_x, 170, 210, 15,
-                          min_val=100, max_val=SLIDER_MAX, initial_val=6000,
+                          min_val=0, max_val=SLIDER_MAX, initial_val=6000,
                           text="Max Particles", is_int=True)
     basic_sliders = [slider_size, slider_count]
 
@@ -1345,19 +1397,7 @@ def _build_ui() -> dict:
 # ---------------------------------------------------------------------------
 
 def _handle_events(state: SimState, ui: dict) -> bool:
-    """Process the Pygame event queue for one frame.
-
-    Handles keyboard shortcuts, mouse presses, slider drags, tab switches,
-    and the quit event. All simulation state mutations from user input happen
-    here.
-
-    Args:
-        state: Current simulation state (mutated in place).
-        ui:    Dict of UI widgets (mutated in place).
-
-    Returns:
-        False if the user closed the window, True otherwise.
-    """
+    """Process the Pygame event queue for one frame."""
     btn_basic      = ui["btn_basic"]
     btn_adv        = ui["btn_adv"]
     active_sliders = ui["basic_sliders"] if btn_basic.active else ui["adv_sliders"]
@@ -1366,23 +1406,34 @@ def _handle_events(state: SimState, ui: dict) -> bool:
         if event.type == pygame.QUIT:
             return False
 
-        # Sliders and tab buttons are checked first so a click on the panel
-        # does not also trigger a fluid push in the simulation viewport.
+        # 1. Feed events to sliders first. If a slider consumes the event 
+        # (like typing a number), ui_consumed becomes True.
         ui_consumed = False
         for slider in active_sliders:
             if slider.handle_event(event):
                 ui_consumed = True
 
+        # 2. Check tab buttons. If we switch tabs, automatically unfocus sliders!
         if btn_basic.handle_event(event):
             btn_basic.active = True
             btn_adv.active   = False
             ui_consumed      = True
+            for s in ui["adv_sliders"]:
+                if s.focused:
+                    s._apply_input()
+                    s.focused = False
+
         if btn_adv.handle_event(event):
             btn_adv.active   = True
             btn_basic.active = False
             ui_consumed      = True
+            for s in ui["basic_sliders"]:
+                if s.focused:
+                    s._apply_input()
+                    s.focused = False
 
-        if event.type == pygame.KEYDOWN:
+        # 3. Only trigger Hotkeys if we AREN'T typing in a UI slider!
+        if event.type == pygame.KEYDOWN and not ui_consumed:
             if event.key == pygame.K_h:
                 state.show_help = not state.show_help
             elif event.key == pygame.K_r:
@@ -1397,6 +1448,7 @@ def _handle_events(state: SimState, ui: dict) -> bool:
             elif event.key == pygame.K_x:
                 _delete_obstacle_under_cursor(state)
 
+        # 4. Only interact with physics if we didn't click the UI
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and not ui_consumed:
             _on_sim_click(state)
 
