@@ -61,6 +61,7 @@ WIDTH: int     = SIM_WIDTH + UI_WIDTH
 HEIGHT: int    = 600
 TARGET_FPS: int = 60
 BACKGROUND_COLOR: Tuple[int, int, int] = (8, 12, 24)
+FPS_HISTORY_LEN = 120
 
 
 # ---------------------------------------------------------------------------
@@ -226,9 +227,11 @@ class SimState:
     grid_head:  np.ndarray
 
     # Simulation mode flags
-    pouring:       bool = True
+    pouring: bool = True
+    sim_paused: bool = False
+    step_one_frame: bool = False
     use_metaballs: bool = False
-    show_help:     bool = True
+    show_help: bool = True
 
     # Rest-density cache — recomputed only when particle_radius changes.
     last_particle_radius: float = -1.0
@@ -236,7 +239,7 @@ class SimState:
 
     # Performance history for the FPS graph (2 s at 60 fps).
     fps_history: Deque[float] = field(
-        default_factory=lambda: deque(maxlen=120)
+        default_factory=lambda: deque(maxlen=FPS_HISTORY_LEN)
     )
 
     # Obstacles — fixed-size arrays; unused slots have obs_active[i] == 0.
@@ -247,8 +250,9 @@ class SimState:
     obs_active: np.ndarray = field(default_factory=lambda: np.zeros(10, dtype=np.int32))
 
     # Mouse interaction state
-    dragging_idx:  int   = -1
-    pushing_water: bool  = False
+    dragging_idx: int = -1
+    pushing_water: bool = False
+    pulling_water: bool = False
     drag_offset_x: float = 0.0
     drag_offset_y: float = 0.0
 
@@ -971,21 +975,24 @@ def apply_mouse_push(
     vxs: np.ndarray, vys: np.ndarray,
     num_active: int,
     cursor_x: float, cursor_y: float,
-    push_radius: float, push_strength: float,
+    push_radius: float, push_strength: float, is_pulling: bool,
 ) -> None:
     """Apply a radial impulse to particles near the cursor position.
 
     Force falls off linearly from push_strength at the cursor to zero at
     push_radius. Particles outside the radius are unaffected.
+    
+    If is_pulling is True, the impulse is inverted to act as a vacuum.
     """
     radius2 = push_radius * push_radius
+    direction = -1.0 if is_pulling else 1.0
     for i in prange(num_active):
         dx = xs[i] - cursor_x
         dy = ys[i] - cursor_y
         d2 = dx * dx + dy * dy
         if 0 < d2 < radius2:
             d       = math.sqrt(d2)
-            impulse = (1.0 - d / push_radius) * push_strength
+            impulse = (1.0 - d / push_radius) * push_strength * direction
             vxs[i] += (dx / d) * impulse
             vys[i] += (dy / d) * impulse
 
@@ -1278,19 +1285,21 @@ def draw_help_overlay(
     title = title_font.render("SPH FLUID PLAYGROUND", True, (255, 255, 255))
     overlay.blit(title, (SIM_WIDTH // 2 - title.get_width() // 2, 80))
 
-    controls = [
+    controls =[
         "--- Controls ---",
-        "[LMB Click + Hold]  Drag a block  OR  push the water",
+        "[LMB / RMB]  Push / Pull the fluid",
         "         (Use the UI panel on the right!)",
-        "[ C ]  Spawn a new block at your cursor",
-        "[ X ]  Delete the block under your cursor",
-        "[ M ]  Toggle metaball rendering",
-        "[SPACE]  Pause / resume pouring",
-        "[ R ]  Reset simulation",
-        "[ H ]  Toggle this help screen",
+        "[ C / X ]    Spawn / Delete a block under cursor",
+        "[ M ]        Toggle metaball rendering",
+        "[ SPACE ]    Pause / resume physics",
+        "[ RIGHT ]    Step one frame (when paused)",
+        "[ P ]        Pause / resume pouring",
+        "[ R ]        Reset simulation",
+        "[ H ]        Toggle this help screen",
         "",
         "Press [H] to close and play!",
     ]
+
     for i, line in enumerate(controls):
         color = (255, 215, 0) if "Press [H]" in line else (200, 220, 255)
         text  = font.render(line, True, color)
@@ -1435,15 +1444,19 @@ def _handle_events(state: SimState, ui: dict) -> bool:
                     s._apply_input()
                     s.focused = False
 
-        # 3. Only trigger Hotkeys if we AREN'T typing in a UI slider!
+        # 3. Keyboard Controls
         if event.type == pygame.KEYDOWN and not ui_consumed:
             if event.key == pygame.K_h:
                 state.show_help = not state.show_help
             elif event.key == pygame.K_r:
                 state.num_active = 0
                 state.pouring    = True
-            elif event.key == pygame.K_SPACE:
+            elif event.key == pygame.K_p:
                 state.pouring = not state.pouring
+            elif event.key == pygame.K_SPACE:
+                state.sim_paused = not state.sim_paused
+            elif event.key == pygame.K_RIGHT:
+                state.step_one_frame = True
             elif event.key == pygame.K_m:
                 state.use_metaballs = not state.use_metaballs
             elif event.key == pygame.K_c:
@@ -1451,13 +1464,22 @@ def _handle_events(state: SimState, ui: dict) -> bool:
             elif event.key == pygame.K_x:
                 _delete_obstacle_under_cursor(state)
 
-        # 4. Only interact with physics if we didn't click the UI
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and not ui_consumed:
-            _on_sim_click(state)
+        # 4. Mouse Click (Push / Pull / Drag)
+        if event.type == pygame.MOUSEBUTTONDOWN and not ui_consumed:
+            mx, my = pygame.mouse.get_pos()
+            if mx < SIM_WIDTH:
+                if event.button == 1:    # Left Click
+                    _on_sim_click(state)
+                elif event.button == 3:  # Right Click
+                    state.pulling_water = True
 
-        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-            state.dragging_idx  = -1
-            state.pushing_water = False
+        # 5. Mouse Release
+        if event.type == pygame.MOUSEBUTTONUP:
+            if event.button == 1:
+                state.dragging_idx  = -1
+                state.pushing_water = False
+            elif event.button == 3:
+                state.pulling_water = False
 
     return True
 
@@ -1583,7 +1605,17 @@ def _step_physics(state: SimState, ui: dict) -> None:
         state.obs_xs[state.dragging_idx] = float(mx - state.drag_offset_x)
         state.obs_ys[state.dragging_idx] = float(my - state.drag_offset_y)
 
-    # Pour new particles while the help overlay is hidden.
+    # --- PAUSE & FRAME STEP LOGIC ---
+    if state.sim_paused and not state.step_one_frame:
+        state._particle_radius = particle_radius
+        state._render_radius   = particle_radius * 2.0
+        state._current_max     = current_max
+        return  # Bypass all physics!
+
+    if state.step_one_frame:
+        state.step_one_frame = False  # Consume the frame step
+
+    # Pour new particles
     if state.pouring and state.num_active < current_max and not state.show_help:
         for _ in range(POUR_RATE):
             if state.num_active >= current_max:
@@ -1594,19 +1626,19 @@ def _step_physics(state: SimState, ui: dict) -> None:
             state.vxs[n] = POUR_VX + random.uniform(-0.3, 0.3)
             state.vys[n] = POUR_VY + random.uniform(-0.2, 0.2)
             state.axs[n] = 0.0
-            # ays[n] is NOT set — integrate() loads gravity into ays every frame.
             state.densities[n] = state.rest_density
             state.num_active  += 1
 
-    # Apply cursor push while LMB is held and help is hidden.
-    if state.pushing_water and state.num_active > 0 and not state.show_help:
+    # Apply cursor push OR pull
+    if (state.pushing_water or state.pulling_water) and state.num_active > 0 and not state.show_help:
         apply_mouse_push(
             state.xs, state.ys, state.vxs, state.vys, state.num_active,
             float(mx), float(my),
             MOUSE_PUSH_RADIUS, MOUSE_PUSH_STRENGTH,
+            state.pulling_water
         )
 
-    # Run the full physics pipeline (skipped while the help overlay is shown).
+    # Run the full physics pipeline
     if state.num_active > 0 and not state.show_help:
         build_grid(
             state.xs, state.ys, state.num_active, smoothing_h,
@@ -1722,15 +1754,17 @@ def _render_frame(
         state.obs_active,
     )
 
-    # Show the cursor influence circle while pushing.
-    if state.pushing_water and not state.show_help:
+    # Show the cursor influence circle while pushing or pulling.
+    if (state.pushing_water or state.pulling_water) and not state.show_help:
         mx, my = pygame.mouse.get_pos()
-        pygame.draw.circle(screen, (255, 255, 255, 100), (mx, my), int(MOUSE_PUSH_RADIUS), 1)
+        color = (255, 100, 100, 100) if state.pulling_water else (255, 255, 255, 100)
+        pygame.draw.circle(screen, color, (mx, my), int(MOUSE_PUSH_RADIUS), 1)
 
-    # HUD: FPS and particle count, top-left corner.
+    # HUD: FPS and particle count
+    pause_text = "  [PAUSED]" if state.sim_paused else ""
     hud = (
         f"FPS: {clock.get_fps():.0f}  |  "
-        f"{state.num_active}/{state._current_max} particles  |  [H] Help"
+        f"{state.num_active}/{state._current_max} particles{pause_text}  |[H] Help"
     )
     screen.blit(small_font.render(hud, True, (150, 180, 220)), (10, 10))
 
